@@ -1,0 +1,89 @@
+import cv2
+import numpy as np
+
+def leaf_disease_with_reconstruction(image_path):
+# 1. Загрузка и предобработка
+img = cv2.imread(image_path)
+if img is None:
+raise FileNotFoundError(f"Не удалось загрузить изображение: {image_path}")
+
+lab = cv2.cvtColor(img, cv2.COLOR_BGR2LAB)
+l, a, b = cv2.split(lab)
+clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+cl = clahe.apply(l)
+limg = cv2.merge((cl, a, b))
+img_processed = cv2.cvtColor(limg, cv2.COLOR_LAB2BGR)
+hsv = cv2.cvtColor(img_processed, cv2.COLOR_BGR2HSV)
+
+# 2. Маска здорового листа (зелёный)
+lower_green = np.array([25, 30, 30])
+upper_green = np.array([90, 255, 255])
+green_mask = cv2.inRange(hsv, lower_green, upper_green)
+
+kernel = np.ones((5, 5), np.uint8)
+green_mask = cv2.morphologyEx(green_mask, cv2.MORPH_CLOSE, kernel)
+green_mask = cv2.morphologyEx(green_mask, cv2.MORPH_OPEN, kernel)
+
+# 3. Поиск контура листа
+contours, _ = cv2.findContours(green_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+if not contours:
+    print("Не найдено зелёных областей")
+    return 0.0
+
+largest_contour = max(contours, key=cv2.contourArea)
+if cv2.contourArea(largest_contour) < 100:
+    print("Найденный объект слишком мал")
+    return 0.0
+
+# 4. Маска реального листа (заполненный контур)
+leaf_mask = np.zeros_like(green_mask)
+cv2.drawContours(leaf_mask, [largest_contour], -1, 255, -1)
+real_leaf_area = cv2.countNonZero(leaf_mask)
+
+# 5. Достройка до полной формы (выпуклый корпус)
+hull = cv2.convexHull(largest_contour)
+full_leaf_mask = np.zeros_like(green_mask)
+cv2.drawContours(full_leaf_mask, [hull], -1, 255, -1)
+full_leaf_area = cv2.countNonZero(full_leaf_mask)
+
+# 6. Маска поражений (жёлтый/коричневый)
+lower_damage = np.array([5, 50, 20])
+upper_damage = np.array([35, 255, 200])
+damage_mask = cv2.inRange(hsv, lower_damage, upper_damage)
+damage_mask = cv2.morphologyEx(damage_mask, cv2.MORPH_OPEN, kernel)
+damage_mask = cv2.morphologyEx(damage_mask, cv2.MORPH_CLOSE, kernel)
+
+# Поражения только на реальном листе
+damage_on_real_leaf = cv2.bitwise_and(damage_mask, leaf_mask)
+damage_area = cv2.countNonZero(damage_on_real_leaf)
+
+# 7. Расчёт процента поражения от полной (восстановленной) площади
+disease_percentage = (damage_area / full_leaf_area) * 100 if full_leaf_area > 0 else 0
+disease_percentage = min(disease_percentage, 100)
+
+# 8. Визуализация
+result = img.copy()
+
+# Контур реального листа (зелёный)
+cv2.drawContours(result, [largest_contour], -1, (0, 255, 0), 2)
+# Контур восстановленного листа (синий)
+cv2.drawContours(result, [hull], -1, (255, 0, 0), 2)
+
+# Красные зоны поражений
+result[damage_on_real_leaf > 0] = (0, 0, 255)
+
+cv2.putText(result, f"Disease: {disease_percentage:.1f}% (от полного листа)",
+           (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 2)
+
+# Окна просмотра (без автоматического закрытия)
+cv2.imshow('Original', img)
+cv2.imshow('Green Mask', green_mask)
+cv2.imshow('Damage Mask', damage_mask)
+cv2.imshow('Real Leaf', leaf_mask)
+cv2.imshow('Full Leaf (Convex Hull)', full_leaf_mask)
+cv2.imshow('Result', result)
+
+cv2.waitKey(0) 
+cv2.destroyAllWindows()
+
+return disease_percentage

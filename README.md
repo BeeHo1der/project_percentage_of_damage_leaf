@@ -8,4 +8,4 @@
 4. Файл проека (Замените на имя вашео фала исполняемой программы)
 
 Пример изображений датасета:
-![Model architecture](dataset/row/101.png)
+![Example](dataset/example.png)

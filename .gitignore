@@ -20,3 +20,6 @@ Desktop.ini
 
 data/*
 !data/README.md
+
+dataset/row/
+dataset/row/*

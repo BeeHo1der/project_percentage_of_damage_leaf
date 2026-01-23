@@ -9,3 +9,4 @@
 
 Пример изображений датасета:
 ![Example](dataset/example.png)
+![Example](dataset/my_plot.png)

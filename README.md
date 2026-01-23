@@ -9,4 +9,6 @@
 
 Пример изображений датасета:
 ![Example](dataset/example.png)
+
+Результат работы программы версии 0.1
 ![Example](dataset/my_plot.png)

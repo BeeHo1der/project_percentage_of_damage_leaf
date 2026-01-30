@@ -11,6 +11,6 @@
 
 ![Example](dataset/example.png)
 
-Результат работы программы версии 0.1:
+Результат работы программы версии v0.2:
 
 ![Example](dataset/res_version_2.png)

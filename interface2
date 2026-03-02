@@ -652,9 +652,7 @@ if __name__ == '__main__':
     try:
         from IPython import get_ipython
         if get_ipython() is not None:
-            print("🚀 ЗАПУСК В JUPYTER")
             print("=" * 50)
-            print("✅ Полная версия с расчетом процентов!")
             print("📊 Зеленый = здоровые участки")
             print("🔴 Красный = повреждения")
             print("=" * 50)

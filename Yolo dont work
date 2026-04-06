@@ -1,8 +1,3 @@
-#!/usr/bin/env python3
-"""
-🍃 Leaf Disease Analyzer with YOLO26 Support
-Полная программа для анализа листьев с детекцией через YOLO26
-"""
 
 import sys
 import cv2
@@ -785,8 +780,7 @@ class LeafDiseaseAnalyzerGUI(QMainWindow):
                     return
                 
                 self.current_image_path = file_path
-                self.display_image(file_path,
-                                self.display_image(file_path, self.original_label)
+                self.display_image(file_path, self.original_label)
                 
                 file_name = os.path.basename(file_path)
                 file_size = os.path.getsize(file_path) / 1024

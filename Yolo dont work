@@ -1,0 +1,1169 @@
+#!/usr/bin/env python3
+"""
+🍃 Leaf Disease Analyzer with YOLO26 Support
+Полная программа для анализа листьев с детекцией через YOLO26
+"""
+
+import sys
+import cv2
+import numpy as np
+import os
+import shutil
+import random
+from datetime import datetime
+from typing import List, Tuple, Dict, Optional
+from pathlib import Path
+
+from PyQt5.QtWidgets import *
+from PyQt5.QtCore import *
+from PyQt5.QtGui import *
+
+# Импорт для YOLO
+try:
+    from ultralytics import YOLO
+    import torch
+    YOLO_AVAILABLE = True
+except ImportError:
+    YOLO_AVAILABLE = False
+    print("⚠️ Ultralytics не установлен. Установите: pip install ultralytics")
+
+
+# ============================================================
+# ЧАСТЬ 1: РАЗДЕЛЕНИЕ ДАТАСЕТА
+# ============================================================
+
+class DatasetSplitter:
+    """Класс для разделения датасета на train/val/test"""
+    
+    @staticmethod
+    def split_yolo_dataset(source_images_dir: str, source_labels_dir: str, 
+                          output_dir: str = "dataset_yolo",
+                          train_ratio: float = 0.7, 
+                          val_ratio: float = 0.2, 
+                          test_ratio: float = 0.1) -> Dict:
+        """
+        Разделение датасета в формате YOLO
+        
+        Args:
+            source_images_dir: папка с исходными изображениями
+            source_labels_dir: папка с txt-разметкой
+            output_dir: выходная папка
+            train_ratio: доля обучения (0.7)
+            val_ratio: доля валидации (0.2)
+            test_ratio: доля тестирования (0.1)
+        """
+        
+        # Получаем список всех изображений
+        image_extensions = ['.jpg', '.jpeg', '.png', '.bmp', '.tiff']
+        all_images = [f for f in os.listdir(source_images_dir) 
+                      if os.path.splitext(f)[1].lower() in image_extensions]
+        
+        # Проверяем наличие разметки
+        valid_images = []
+        for img in all_images:
+            name = os.path.splitext(img)[0]
+            label_path = os.path.join(source_labels_dir, f"{name}.txt")
+            if os.path.exists(label_path):
+                valid_images.append(img)
+        
+        if len(valid_images) == 0:
+            raise ValueError("Не найдено изображений с разметкой!")
+        
+        print(f"📊 Всего изображений с разметкой: {len(valid_images)}")
+        
+        # Разделяем
+        from sklearn.model_selection import train_test_split
+        
+        train_images, temp_images = train_test_split(
+            valid_images, train_size=train_ratio, random_state=42
+        )
+        
+        val_ratio_adjusted = val_ratio / (val_ratio + test_ratio)
+        val_images, test_images = train_test_split(
+            temp_images, train_size=val_ratio_adjusted, random_state=42
+        )
+        
+        # Создаём структуру
+        for split in ['train', 'val', 'test']:
+            os.makedirs(os.path.join(output_dir, 'images', split), exist_ok=True)
+            os.makedirs(os.path.join(output_dir, 'labels', split), exist_ok=True)
+        
+        # Копируем файлы
+        def copy_files(image_list, split_name):
+            for img in image_list:
+                name = os.path.splitext(img)[0]
+                shutil.copy2(
+                    os.path.join(source_images_dir, img),
+                    os.path.join(output_dir, 'images', split_name, img)
+                )
+                shutil.copy2(
+                    os.path.join(source_labels_dir, f"{name}.txt"),
+                    os.path.join(output_dir, 'labels', split_name, f"{name}.txt")
+                )
+        
+        copy_files(train_images, 'train')
+        copy_files(val_images, 'val')
+        copy_files(test_images, 'test')
+        
+        print(f"✅ Разделение завершено!")
+        print(f"   Train: {len(train_images)} изображений")
+        print(f"   Val:   {len(val_images)} изображений")
+        print(f"   Test:  {len(test_images)} изображений")
+        
+        return {
+            'train': len(train_images),
+            'val': len(val_images),
+            'test': len(test_images),
+            'output_dir': output_dir
+        }
+
+
+# ============================================================
+# ЧАСТЬ 2: YOLO ДЕТЕКТОР
+# ============================================================
+
+class YOLODetector:
+    """Обёртка для YOLO модели"""
+    
+    def __init__(self, model_path: str = None, auto_download: bool = True):
+        if not YOLO_AVAILABLE:
+            raise ImportError("Ultralytics не установлен")
+        
+        self.device = "cuda" if torch.cuda.is_available() else "cpu"
+        
+        # Поиск модели
+        if model_path is None or not os.path.exists(model_path):
+            possible_paths = [
+                "runs/yolo26/leaf_detection/weights/best.pt",
+                "yolo26n.pt",
+                "best.pt"
+            ]
+            for path in possible_paths:
+                if os.path.exists(path):
+                    model_path = path
+                    break
+        
+        if model_path and os.path.exists(model_path):
+            self.model = YOLO(model_path)
+            print(f"✅ YOLO загружен: {model_path}")
+        elif auto_download:
+            print("📥 Загрузка предобученной модели YOLO26...")
+            self.model = YOLO("yolo26n.pt")
+        else:
+            raise FileNotFoundError("Модель YOLO не найдена")
+        
+        self.model.to(self.device)
+        print(f"🚀 YOLO на устройстве: {self.device}")
+    
+    def detect(self, image: np.ndarray, conf_threshold: float = 0.25) -> List[Dict]:
+        """
+        Детекция листьев и повреждений
+        
+        Args:
+            image: изображение BGR
+            conf_threshold: порог уверенности
+        
+        Returns:
+            список детекций
+        """
+        results = self.model(image, conf=conf_threshold, verbose=False)
+        
+        detections = []
+        if len(results) > 0 and results[0].boxes is not None:
+            boxes = results[0].boxes
+            for box in boxes:
+                x1, y1, x2, y2 = box.xyxy[0].tolist()
+                confidence = float(box.conf[0])
+                class_id = int(box.cls[0])
+                class_name = 'leaf' if class_id == 0 else 'damage'
+                
+                detections.append({
+                    'class': class_name,
+                    'class_id': class_id,
+                    'bbox': [int(x1), int(y1), int(x2), int(y2)],
+                    'confidence': confidence
+                })
+        
+        return detections
+    
+    def train(self, dataset_yaml: str, epochs: int = 100, imgsz: int = 640,
+              batch: int = 4, device: str = "cpu") -> str:
+        """
+        Обучение модели YOLO
+        
+        Args:
+            dataset_yaml: путь к YAML конфигу датасета
+            epochs: количество эпох
+            imgsz: размер изображения
+            batch: размер батча
+            device: устройство (cpu/cuda)
+        
+        Returns:
+            путь к лучшей модели
+        """
+        print(f"🚀 Начало обучения YOLO на {epochs} эпох...")
+        
+        results = self.model.train(
+            data=dataset_yaml,
+            epochs=epochs,
+            imgsz=imgsz,
+            batch=batch,
+            device=device,
+            workers=0,
+            patience=20,
+            save=True,
+            project="runs/yolo26",
+            name="leaf_detection",
+            exist_ok=True,
+            verbose=True
+        )
+        
+        best_model_path = "runs/yolo26/leaf_detection/weights/best.pt"
+        print(f"✅ Обучение завершено! Модель: {best_model_path}")
+        
+        # Обновляем модель
+        self.model = YOLO(best_model_path)
+        
+        return best_model_path
+
+
+# ============================================================
+# ЧАСТЬ 3: ОСНОВНОЙ АНАЛИЗАТОР ЛИСТЬЕВ
+# ============================================================
+
+class LeafDiseaseAnalyzer:
+    """Анализатор листьев с поддержкой YOLO и классического CV"""
+    
+    def __init__(self, pixels_per_cm: float = 62.0, min_leaf_area_cm: float = 0.5,
+                 use_yolo: bool = True, yolo_model_path: str = None):
+        
+        self.pixels_per_cm = pixels_per_cm
+        self.min_leaf_area_cm = min_leaf_area_cm
+        self.use_yolo = use_yolo and YOLO_AVAILABLE
+        
+        # Инициализация YOLO
+        self.yolo = None
+        if self.use_yolo:
+            try:
+                self.yolo = YOLODetector(yolo_model_path)
+            except Exception as e:
+                print(f"⚠️ YOLO не загружен: {e}")
+                self.use_yolo = False
+        
+        # Диапазоны для здоровых листьев (зеленые оттенки)
+        self.healthy_ranges = {
+            'green_light': {'lower': [25, 20, 50], 'upper': [85, 255, 255]},
+            'green_dark': {'lower': [25, 20, 20], 'upper': [95, 255, 180]},
+            'green_yellowish': {'lower': [20, 20, 40], 'upper': [45, 255, 255]},
+        }
+        
+        # Диапазоны для повреждений
+        self.damage_ranges = {
+            'yellow': {'lower': [15, 40, 100], 'upper': [35, 255, 255]},
+            'brown_1': {'lower': [0, 30, 30], 'upper': [20, 255, 150]},
+            'brown_2': {'lower': [160, 30, 30], 'upper': [180, 255, 150]},
+            'white': {'lower': [0, 0, 200], 'upper': [180, 40, 255]},
+            'necrotic': {'lower': [0, 0, 0], 'upper': [180, 255, 50]},
+        }
+    
+    def preprocess_image(self, image_path: str) -> Tuple[np.ndarray, np.ndarray]:
+        """Предобработка изображения"""
+        img = cv2.imread(image_path)
+        if img is None:
+            raise FileNotFoundError(f"Не удалось загрузить изображение: {image_path}")
+        
+        # Изменяем размер для удобства
+        height, width = img.shape[:2]
+        if width > 1000:
+            scale = 1000 / width
+            new_size = (int(width * scale), int(height * scale))
+            img = cv2.resize(img, new_size)
+        
+        original = img.copy()
+        hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
+        
+        return original, hsv
+    
+    def create_mask(self, hsv: np.ndarray, ranges: Dict) -> np.ndarray:
+        """Создание маски из нескольких диапазонов"""
+        combined_mask = np.zeros(hsv.shape[:2], dtype=np.uint8)
+        
+        for name, range_dict in ranges.items():
+            lower = np.array(range_dict['lower'])
+            upper = np.array(range_dict['upper'])
+            mask = cv2.inRange(hsv, lower, upper)
+            combined_mask = cv2.bitwise_or(combined_mask, mask)
+        
+        # Морфологические операции
+        kernel = np.ones((3, 3), np.uint8)
+        combined_mask = cv2.morphologyEx(combined_mask, cv2.MORPH_OPEN, kernel)
+        combined_mask = cv2.morphologyEx(combined_mask, cv2.MORPH_CLOSE, kernel)
+        
+        return combined_mask
+    
+    def find_leaves_by_color(self, mask: np.ndarray) -> List[Tuple[np.ndarray, float, float]]:
+        """Поиск листьев по цветовой маске (классический метод)"""
+        contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        
+        leaf_info = []
+        for contour in contours:
+            area_px = cv2.contourArea(contour)
+            area_cm = area_px / (self.pixels_per_cm ** 2)
+            
+            if area_cm >= self.min_leaf_area_cm:
+                epsilon = 0.01 * cv2.arcLength(contour, True)
+                approx = cv2.approxPolyDP(contour, epsilon, True)
+                leaf_info.append((approx, area_px, area_cm))
+        
+        # Сортируем по площади
+        leaf_info.sort(key=lambda x: x[1], reverse=True)
+        
+        return leaf_info
+    
+    def get_yolo_contours(self, image: np.ndarray, detections: List[Dict]) -> List[Tuple[np.ndarray, float, float]]:
+        """Преобразование YOLO детекций в контуры"""
+        leaf_info = []
+        leaf_detections = [d for d in detections if d['class'] == 'leaf']
+        
+        for det in leaf_detections:
+            x1, y1, x2, y2 = det['bbox']
+            # Создаём контур из bbox
+            contour = np.array([
+                [x1, y1],
+                [x2, y1],
+                [x2, y2],
+                [x1, y2]
+            ], dtype=np.int32)
+            
+            area_px = (x2 - x1) * (y2 - y1)
+            area_cm = area_px / (self.pixels_per_cm ** 2)
+            leaf_info.append((contour, area_px, area_cm))
+        
+        return leaf_info
+    
+    def analyze_leaf(self, contour: np.ndarray, 
+                    healthy_mask: np.ndarray,
+                    damage_mask: np.ndarray) -> Dict:
+        """Анализ отдельного листа"""
+        
+        # Создаем маску листа
+        leaf_mask = np.zeros_like(healthy_mask)
+        cv2.drawContours(leaf_mask, [contour], -1, 255, -1)
+        
+        # Общая площадь листа
+        total_area_px = cv2.contourArea(contour)
+        total_area_cm = total_area_px / (self.pixels_per_cm ** 2)
+        
+        # Здоровые участки
+        healthy_pixels = cv2.bitwise_and(healthy_mask, leaf_mask)
+        healthy_area_px = cv2.countNonZero(healthy_pixels)
+        healthy_area_cm = healthy_area_px / (self.pixels_per_cm ** 2)
+        
+        # Поврежденные участки
+        damaged_pixels = cv2.bitwise_and(damage_mask, leaf_mask)
+        damaged_area_px = cv2.countNonZero(damaged_pixels)
+        damaged_area_cm = damaged_area_px / (self.pixels_per_cm ** 2)
+        
+        # Проценты
+        if total_area_px > 0:
+            healthy_percent = (healthy_area_px / total_area_px) * 100
+            damaged_percent = (damaged_area_px / total_area_px) * 100
+        else:
+            healthy_percent = 0
+            damaged_percent = 0
+        
+        return {
+            'total_area_cm': total_area_cm,
+            'healthy_area_cm': healthy_area_cm,
+            'damaged_area_cm': damaged_area_cm,
+            'healthy_percent': healthy_percent,
+            'damaged_percent': damaged_percent,
+            'leaf_mask': leaf_mask,
+            'healthy_mask': healthy_pixels,
+            'damage_mask': damaged_pixels
+        }
+    
+    def analyze_image(self, image_path: str) -> Dict:
+        """Полный анализ изображения"""
+        try:
+            original, hsv = self.preprocess_image(image_path)
+            
+            # Создаем маски
+            healthy_mask = self.create_mask(hsv, self.healthy_ranges)
+            damage_mask = self.create_mask(hsv, self.damage_ranges)
+            pure_healthy = cv2.bitwise_and(healthy_mask, cv2.bitwise_not(damage_mask))
+            
+            # YOLO детекция
+            yolo_detections = []
+            if self.use_yolo and self.yolo:
+                yolo_detections = self.yolo.detect(original)
+                print(f"🎯 YOLO: {len([d for d in yolo_detections if d['class']=='leaf'])} листьев, "
+                      f"{len([d for d in yolo_detections if d['class']=='damage'])} повреждений")
+            
+            # Находим листья (YOLO или цветовой метод)
+            if self.use_yolo and len(yolo_detections) > 0:
+                leaf_info = self.get_yolo_contours(original, yolo_detections)
+                method_used = "YOLO"
+            else:
+                leaf_info = self.find_leaves_by_color(pure_healthy)
+                method_used = "Color"
+            
+            # Создаем визуализацию масок
+            mask_viz = self.create_mask_visualization(original, pure_healthy, damage_mask, yolo_detections)
+            
+            # Анализируем каждый лист
+            results_list = []
+            total_healthy = 0
+            total_damaged = 0
+            total_area = 0
+            
+            for contour, area_px, area_cm in leaf_info:
+                leaf_result = self.analyze_leaf(contour, pure_healthy, damage_mask)
+                results_list.append(leaf_result)
+                total_healthy += leaf_result['healthy_area_cm']
+                total_damaged += leaf_result['damaged_area_cm']
+                total_area += leaf_result['total_area_cm']
+            
+            # Общие проценты
+            if total_area > 0:
+                overall_healthy = (total_healthy / total_area) * 100
+                overall_damaged = (total_damaged / total_area) * 100
+            else:
+                overall_healthy = 0
+                overall_damaged = 0
+            
+            # Визуализация
+            visualization = self.create_result_visualization(
+                original, leaf_info, results_list, yolo_detections, method_used
+            )
+            
+            return {
+                'total_leaves': len(results_list),
+                'leaves': results_list,
+                'total_area_cm': total_area,
+                'total_healthy_cm': total_healthy,
+                'total_damaged_cm': total_damaged,
+                'healthy_percent': overall_healthy,
+                'damaged_percent': overall_damaged,
+                'method_used': method_used,
+                'yolo_detections': yolo_detections,
+                'visualization': visualization,
+                'mask_viz': mask_viz
+            }
+            
+        except Exception as e:
+            print(f"❌ Ошибка: {e}")
+            import traceback
+            traceback.print_exc()
+            raise
+    
+    def create_mask_visualization(self, img: np.ndarray, healthy_mask: np.ndarray,
+                                   damage_mask: np.ndarray, detections: List[Dict]) -> np.ndarray:
+        """Визуализация масок"""
+        vis = img.copy()
+        
+        # Зеленый overlay для здоровых
+        healthy_overlay = np.zeros_like(vis)
+        healthy_overlay[healthy_mask > 0] = [0, 255, 0]
+        cv2.addWeighted(healthy_overlay, 0.4, vis, 1.0, 0, vis)
+        
+        # Красный overlay для повреждений
+        damaged_overlay = np.zeros_like(vis)
+        damaged_overlay[damage_mask > 0] = [0, 0, 255]
+        cv2.addWeighted(damaged_overlay, 0.6, vis, 1.0, 0, vis)
+        
+        # Рисуем YOLO боксы
+        for det in detections:
+            x1, y1, x2, y2 = det['bbox']
+            color = (0, 255, 0) if det['class'] == 'leaf' else (0, 0, 255)
+            cv2.rectangle(vis, (x1, y1), (x2, y2), color, 2)
+            label = f"{det['class']}: {det['confidence']:.2f}"
+            cv2.putText(vis, label, (x1, y1-5), cv2.FONT_HERSHEY_SIMPLEX, 0.4, color, 1)
+        
+        # Легенда
+        cv2.rectangle(vis, (10, 10), (200, 70), (0, 0, 0), -1)
+        cv2.putText(vis, "🟢 Здоровые участки", (15, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 255, 0), 1)
+        cv2.putText(vis, "🔴 Повреждения", (15, 50), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 0, 255), 1)
+        
+        return vis
+    
+    def create_result_visualization(self, img: np.ndarray, leaf_info: List,
+                                     results: List, detections: List[Dict],
+                                     method_used: str) -> np.ndarray:
+        """Визуализация результатов"""
+        vis = img.copy()
+        
+        for i, (contour, area_px, area_cm) in enumerate(leaf_info):
+            if i < len(results):
+                result = results[i]
+                
+                # Рисуем контур
+                cv2.drawContours(vis, [contour], -1, (255, 255, 255), 2)
+                
+                # Добавляем информацию
+                M = cv2.moments(contour)
+                if M['m00'] != 0:
+                    cx = int(M['m10'] / M['m00'])
+                    cy = int(M['m01'] / M['m00'])
+                    
+                    # Фон для текста
+                    cv2.rectangle(vis, (cx-70, cy-35), (cx+70, cy+15), (0, 0, 0), -1)
+                    
+                    # Текст
+                    text1 = f"L{i+1}: {result['total_area_cm']:.1f}см²"
+                    text2 = f"Зд:{result['healthy_percent']:.0f}% Пов:{result['damaged_percent']:.0f}%"
+                    
+                    cv2.putText(vis, text1, (cx-65, cy-20), cv2.FONT_HERSHEY_SIMPLEX, 0.35, (255, 255, 255), 1)
+                    cv2.putText(vis, text2, (cx-65, cy), cv2.FONT_HERSHEY_SIMPLEX, 0.35, (255, 255, 255), 1)
+        
+        # Рисуем YOLO боксы для повреждений
+        for det in detections:
+            if det['class'] == 'damage':
+                x1, y1, x2, y2 = det['bbox']
+                cv2.rectangle(vis, (x1, y1), (x2, y2), (0, 0, 255), 1)
+        
+        # Общая информация
+        if results:
+            total_damage = sum(r['damaged_percent'] for r in results) / len(results)
+            total_healthy = sum(r['healthy_percent'] for r in results) / len(results)
+            info = f"{method_used} | Листьев: {len(results)} | Здоровье: {total_healthy:.0f}% | Поражение: {total_damage:.0f}%"
+            
+            cv2.rectangle(vis, (10, 10), (450, 35), (0, 0, 0), -1)
+            cv2.putText(vis, info, (15, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 255, 255), 1)
+        
+        return vis
+
+
+# ============================================================
+# ЧАСТЬ 4: GUI ПРИЛОЖЕНИЕ
+# ============================================================
+
+class LeafDiseaseAnalyzerGUI(QMainWindow):
+    def __init__(self):
+        super().__init__()
+        self.analyzer = None
+        self.current_image_path = None
+        self.results = None
+        self.initUI()
+    
+    def initUI(self):
+        self.setWindowTitle('🍃 Анализатор листьев v6.0 (YOLO + CV)')
+        self.setGeometry(100, 100, 1500, 850)
+        
+        central_widget = QWidget()
+        self.setCentralWidget(central_widget)
+        main_layout = QHBoxLayout()
+        central_widget.setLayout(main_layout)
+        
+        # Левая панель
+        left_panel = self.create_left_panel()
+        main_layout.addWidget(left_panel)
+        
+        # Правая панель с вкладками
+        right_panel = self.create_right_panel()
+        main_layout.addWidget(right_panel)
+        
+        self.status_bar = QStatusBar()
+        self.setStatusBar(self.status_bar)
+        self.status_bar.showMessage('✅ Готов к работе')
+    
+    def create_left_panel(self):
+        panel = QWidget()
+        panel.setMaximumWidth(450)
+        layout = QVBoxLayout()
+        
+        # Заголовок
+        title = QLabel('🍃 Анализатор листьев')
+        title.setStyleSheet('''
+            font-size: 20px; font-weight: bold; color: #27ae60;
+            padding: 15px; background-color: #f0f8f0;
+            border-radius: 8px; border-left: 5px solid #27ae60;
+        ''')
+        layout.addWidget(title)
+        
+        # Кнопки
+        btn_layout = QVBoxLayout()
+        
+        self.load_btn = QPushButton('📁 Загрузить изображение')
+        self.load_btn.setStyleSheet(self.get_button_style('#3498db', '#2980b9'))
+        self.load_btn.clicked.connect(self.load_image)
+        btn_layout.addWidget(self.load_btn)
+        
+        self.analyze_btn = QPushButton('🔬 Анализировать')
+        self.analyze_btn.setStyleSheet(self.get_button_style('#27ae60', '#229954'))
+        self.analyze_btn.clicked.connect(self.analyze)
+        self.analyze_btn.setEnabled(False)
+        btn_layout.addWidget(self.analyze_btn)
+        
+        layout.addLayout(btn_layout)
+        
+        # Информация о файле
+        info_group = QGroupBox('📄 Информация')
+        info_layout = QVBoxLayout()
+        self.file_info = QLabel('Файл не загружен')
+        self.file_info.setWordWrap(True)
+        self.file_info.setStyleSheet('padding: 10px; background-color: #f8f9fa; border-radius: 5px;')
+        info_layout.addWidget(self.file_info)
+        info_group.setLayout(info_layout)
+        layout.addWidget(info_group)
+        
+        # Параметры
+        params_group = QGroupBox('⚙️ Параметры')
+        params_layout = QFormLayout()
+        
+        self.ppc_spin = QDoubleSpinBox()
+        self.ppc_spin.setRange(10, 200)
+        self.ppc_spin.setValue(62.0)
+        self.ppc_spin.setSuffix(' px/см')
+        params_layout.addRow('Пикселей/см:', self.ppc_spin)
+        
+        self.min_area_spin = QDoubleSpinBox()
+        self.min_area_spin.setRange(0.1, 20)
+        self.min_area_spin.setValue(0.5)
+        self.min_area_spin.setSuffix(' см²')
+        params_layout.addRow('Мин. площадь:', self.min_area_spin)
+        
+        self.yolo_checkbox = QCheckBox()
+        self.yolo_checkbox.setChecked(YOLO_AVAILABLE)
+        self.yolo_checkbox.setEnabled(YOLO_AVAILABLE)
+        params_layout.addRow('Использовать YOLO:', self.yolo_checkbox)
+        
+        params_group.setLayout(params_layout)
+        layout.addWidget(params_group)
+        
+        # Результаты
+        results_group = QGroupBox('📊 Результаты')
+        results_layout = QVBoxLayout()
+        self.results_text = QTextEdit()
+        self.results_text.setReadOnly(True)
+        self.results_text.setMaximumHeight(180)
+        self.results_text.setStyleSheet('font-family: monospace; font-size: 12px; background-color: #f8f9fa;')
+        results_layout.addWidget(self.results_text)
+        results_group.setLayout(results_layout)
+        layout.addWidget(results_group)
+        
+        # Прогресс
+        self.progress = QProgressBar()
+        self.progress.hide()
+        layout.addWidget(self.progress)
+        
+        layout.addStretch()
+        panel.setLayout(layout)
+        return panel
+    
+    def create_right_panel(self):
+        panel = QTabWidget()
+        panel.setMinimumWidth(1000)
+        
+        # Вкладка с результатом
+        result_tab = QWidget()
+        result_layout = QVBoxLayout()
+        self.result_label = QLabel()
+        self.result_label.setAlignment(Qt.AlignCenter)
+        self.result_label.setStyleSheet('border: 1px solid #dee2e6; background-color: #f8f9fa; min-height: 600px;')
+        self.result_label.setText('Анализ не выполнен')
+        result_layout.addWidget(self.result_label)
+        result_tab.setLayout(result_layout)
+        panel.addTab(result_tab, '📈 Результат')
+        
+        # Вкладка с масками
+        mask_tab = QWidget()
+        mask_layout = QVBoxLayout()
+        self.mask_label = QLabel()
+        self.mask_label.setAlignment(Qt.AlignCenter)
+        self.mask_label.setStyleSheet('border: 1px solid #dee2e6; background-color: #f8f9fa; min-height: 600px;')
+        self.mask_label.setText('Маска появится после анализа')
+        mask_layout.addWidget(self.mask_label)
+        mask_tab.setLayout(mask_layout)
+        panel.addTab(mask_tab, '🎨 Маски')
+        
+        # Вкладка с оригиналом
+        original_tab = QWidget()
+        original_layout = QVBoxLayout()
+        self.original_label = QLabel()
+        self.original_label.setAlignment(Qt.AlignCenter)
+        self.original_label.setStyleSheet('border: 1px solid #dee2e6; background-color: #f8f9fa; min-height: 600px;')
+        self.original_label.setText('Загрузите изображение')
+        original_layout.addWidget(self.original_label)
+        original_tab.setLayout(original_layout)
+        panel.addTab(original_tab, '🖼 Оригинал')
+        
+        # Вкладка с обучением YOLO
+        train_tab = QWidget()
+        train_layout = QVBoxLayout()
+        
+        # Параметры обучения
+        train_params = QGroupBox('🚀 Обучение YOLO модели')
+        params_layout = QFormLayout()
+        
+        self.images_dir = QLineEdit()
+        self.images_dir.setPlaceholderText('Путь к папке с изображениями')
+        params_layout.addRow('Изображения:', self.images_dir)
+        
+        self.labels_dir = QLineEdit()
+        self.labels_dir.setPlaceholderText('Путь к папке с txt-разметкой')
+        params_layout.addRow('Разметка:', self.labels_dir)
+        
+        self.epochs_spin = QSpinBox()
+        self.epochs_spin.setRange(10, 500)
+        self.epochs_spin.setValue(100)
+        params_layout.addRow('Эпохи:', self.epochs_spin)
+        
+        self.train_btn = QPushButton('🏋️ Начать обучение YOLO')
+        self.train_btn.setStyleSheet(self.get_button_style('#e67e22', '#d35400'))
+        self.train_btn.clicked.connect(self.start_training)
+        params_layout.addRow('', self.train_btn)
+        
+        train_params.setLayout(params_layout)
+        train_layout.addWidget(train_params)
+        
+        # Лог обучения
+        self.train_log = QTextEdit()
+        self.train_log.setReadOnly(True)
+        self.train_log.setStyleSheet('font-family: monospace; font-size: 10px; background-color: #2d2d2d; color: #00ff00;')
+        train_layout.addWidget(self.train_log)
+        
+        train_tab.setLayout(train_layout)
+        panel.addTab(train_tab, '🤖 Обучение YOLO')
+        
+        # Вкладка с разделением датасета
+        split_tab = QWidget()
+        split_layout = QVBoxLayout()
+        
+        split_params = QGroupBox('📂 Разделение датасета')
+        split_form = QFormLayout()
+        
+        self.split_images_dir = QLineEdit()
+        self.split_images_dir.setPlaceholderText('Папка с изображениями')
+        split_form.addRow('Изображения:', self.split_images_dir)
+        
+        self.split_labels_dir = QLineEdit()
+        self.split_labels_dir.setPlaceholderText('Папка с txt-разметкой')
+        split_form.addRow('Разметка:', self.split_labels_dir)
+        
+        self.split_output_dir = QLineEdit("dataset_yolo")
+        split_form.addRow('Выходная папка:', self.split_output_dir)
+        
+        self.split_btn = QPushButton('📊 Разделить датасет')
+        self.split_btn.setStyleSheet(self.get_button_style('#9b59b6', '#8e44ad'))
+        self.split_btn.clicked.connect(self.split_dataset)
+        split_form.addRow('', self.split_btn)
+        
+        split_params.setLayout(split_form)
+        split_layout.addWidget(split_params)
+        
+        self.split_result = QTextEdit()
+        self.split_result.setReadOnly(True)
+        split_layout.addWidget(self.split_result)
+        
+        split_tab.setLayout(split_layout)
+        panel.addTab(split_tab, '📁 Разделение датасета')
+        
+        return panel
+    
+    def get_button_style(self, color, hover):
+        return f'''
+            QPushButton {{
+                background-color: {color}; color: white; font-size: 13px; font-weight: bold;
+                padding: 12px; border-radius: 8px; margin: 5px; border: none;
+            }}
+            QPushButton:hover {{ background-color: {hover}; border: 2px solid white; }}
+            QPushButton:disabled {{ background-color: #bdc3c7; }}
+        '''
+    
+    def load_image(self):
+        file_path, _ = QFileDialog.getOpenFileName(
+            self, 'Выберите изображение', os.path.expanduser("~"),
+            'Изображения (*.png *.jpg *.jpeg *.bmp *.tiff);;Все файлы (*.*)'
+        )
+        
+        if file_path:
+            try:
+                test_img = cv2.imread(file_path)
+                if test_img is None:
+                    QMessageBox.critical(self, '❌ Ошибка', 'Не удалось загрузить изображение')
+                    return
+                
+                self.current_image_path = file_path
+                self.display_image(file_path,
+                                self.display_image(file_path, self.original_label)
+                
+                file_name = os.path.basename(file_path)
+                file_size = os.path.getsize(file_path) / 1024
+                file_size_str = f"{file_size:.1f} KB" if file_size < 1024 else f"{file_size/1024:.2f} MB"
+                
+                self.file_info.setText(f'📁 {file_name}\n📏 {file_size_str}')
+                self.analyze_btn.setEnabled(True)
+                self.status_bar.showMessage(f'✅ Загружено: {file_name}')
+                
+            except Exception as e:
+                QMessageBox.critical(self, '❌ Ошибка', f'Ошибка: {str(e)}')
+    
+    def display_image(self, image_path, label_widget):
+        try:
+            pixmap = QPixmap(image_path)
+            if not pixmap.isNull():
+                scaled = pixmap.scaled(900, 600, Qt.KeepAspectRatio, Qt.SmoothTransformation)
+                label_widget.setPixmap(scaled)
+                label_widget.setText("")
+        except:
+            label_widget.setText("❌ Ошибка загрузки")
+    
+    def display_cv_image(self, cv_img, label_widget):
+        """Отображение OpenCV изображения в QLabel"""
+        try:
+            if cv_img is not None:
+                rgb = cv2.cvtColor(cv_img, cv2.COLOR_BGR2RGB)
+                h, w, ch = rgb.shape
+                qt_img = QImage(rgb.data, w, h, ch * w, QImage.Format_RGB888)
+                pixmap = QPixmap.fromImage(qt_img)
+                scaled = pixmap.scaled(900, 600, Qt.KeepAspectRatio, Qt.SmoothTransformation)
+                label_widget.setPixmap(scaled)
+                label_widget.setText("")
+        except Exception as e:
+            label_widget.setText(f"❌ Ошибка: {str(e)}")
+    
+    def analyze(self):
+        if not self.current_image_path:
+            return
+        
+        try:
+            self.progress.show()
+            self.progress.setValue(0)
+            self.status_bar.showMessage('🔄 Анализ...')
+            QApplication.processEvents()
+            
+            # Создаем анализатор с текущими параметрами
+            self.analyzer = LeafDiseaseAnalyzer(
+                pixels_per_cm=self.ppc_spin.value(),
+                min_leaf_area_cm=self.min_area_spin.value(),
+                use_yolo=self.yolo_checkbox.isChecked()
+            )
+            
+            self.progress.setValue(30)
+            QApplication.processEvents()
+            
+            # Анализируем
+            self.results = self.analyzer.analyze_image(self.current_image_path)
+            
+            self.progress.setValue(80)
+            QApplication.processEvents()
+            
+            # Отображаем результаты
+            if 'visualization' in self.results:
+                self.display_cv_image(self.results['visualization'], self.result_label)
+            
+            if 'mask_viz' in self.results:
+                self.display_cv_image(self.results['mask_viz'], self.mask_label)
+            
+            self.display_results()
+            
+            self.progress.setValue(100)
+            self.status_bar.showMessage(f'✅ Анализ завершен (метод: {self.results["method_used"]})')
+            
+        except Exception as e:
+            QMessageBox.critical(self, '❌ Ошибка', f'Ошибка анализа:\n{str(e)}')
+        finally:
+            self.progress.hide()
+    
+    def display_results(self):
+        if not self.results:
+            return
+        
+        leaves = self.results.get('total_leaves', 0)
+        total = self.results.get('total_area_cm', 0.0)
+        healthy = self.results.get('total_healthy_cm', 0.0)
+        damaged = self.results.get('total_damaged_cm', 0.0)
+        healthy_pct = self.results.get('healthy_percent', 0.0)
+        damaged_pct = self.results.get('damaged_percent', 0.0)
+        method = self.results.get('method_used', 'Unknown')
+        
+        text = [
+            "🍃 РЕЗУЛЬТАТЫ АНАЛИЗА",
+            "=" * 40,
+            f"🎯 Метод детекции: {method}",
+            f"📊 Листьев: {leaves}",
+            f"📐 Общая площадь: {total:.1f} см²",
+            f"🟢 Здоровая площадь: {healthy:.1f} см² ({healthy_pct:.1f}%)",
+            f"🔴 Поврежденная площадь: {damaged:.1f} см² ({damaged_pct:.1f}%)",
+            f"⚠️ Общий процент поражения: {damaged_pct:.1f}%"
+        ]
+        
+        if damaged_pct < 10:
+            text.append("\n✅ Состояние: Хорошее")
+        elif damaged_pct < 30:
+            text.append("\n⚠️ Состояние: Среднее (требуется наблюдение)")
+        else:
+            text.append("\n🔴 Состояние: Плохое (требуется лечение)")
+        
+        if leaves > 0:
+            text.append("\n📊 ПО ЛИСТЬЯМ:")
+            for i, leaf in enumerate(self.results.get('leaves', [])):
+                text.append(f"  Лист {i+1}: {leaf['total_area_cm']:.1f}см², "
+                          f"Зд:{leaf['healthy_percent']:.0f}%, "
+                          f"Пов:{leaf['damaged_percent']:.0f}%")
+        
+        # Добавляем информацию о YOLO детекциях
+        yolo_dets = self.results.get('yolo_detections', [])
+        if yolo_dets:
+            leaf_count = len([d for d in yolo_dets if d['class'] == 'leaf'])
+            damage_count = len([d for d in yolo_dets if d['class'] == 'damage'])
+            text.append(f"\n🎯 YOLO обнаружил: {leaf_count} листьев, {damage_count} повреждений")
+        
+        self.results_text.setText('\n'.join(text))
+    
+    def split_dataset(self):
+        """Разделение датасета"""
+        images_dir = self.split_images_dir.text()
+        labels_dir = self.split_labels_dir.text()
+        output_dir = self.split_output_dir.text()
+        
+        if not images_dir or not labels_dir:
+            QMessageBox.warning(self, 'Ошибка', 'Укажите пути к изображениям и разметке')
+            return
+        
+        if not os.path.exists(images_dir):
+            QMessageBox.warning(self, 'Ошибка', f'Папка с изображениями не найдена: {images_dir}')
+            return
+        
+        if not os.path.exists(labels_dir):
+            QMessageBox.warning(self, 'Ошибка', f'Папка с разметкой не найдена: {labels_dir}')
+            return
+        
+        try:
+            self.split_result.clear()
+            self.split_result.append("🚀 Начало разделения датасета...")
+            self.split_result.append(f"📁 Изображения: {images_dir}")
+            self.split_result.append(f"📁 Разметка: {labels_dir}")
+            self.split_result.append("")
+            QApplication.processEvents()
+            
+            # Импортируем sklearn если нужно
+            try:
+                from sklearn.model_selection import train_test_split
+            except ImportError:
+                self.split_result.append("❌ Установите scikit-learn: pip install scikit-learn")
+                return
+            
+            # Разделяем
+            result = DatasetSplitter.split_yolo_dataset(
+                images_dir, labels_dir, output_dir,
+                train_ratio=0.7, val_ratio=0.2, test_ratio=0.1
+            )
+            
+            self.split_result.append(f"\n✅ Разделение завершено!")
+            self.split_result.append(f"   📁 Выходная папка: {output_dir}")
+            self.split_result.append(f"   📊 Train: {result['train']} изображений")
+            self.split_result.append(f"   📊 Val:   {result['val']} изображений")
+            self.split_result.append(f"   📊 Test:  {result['test']} изображений")
+            self.split_result.append(f"\n📄 Создайте файл leaf_dataset.yaml:")
+            self.split_result.append(f"""
+path: ./{output_dir}
+train: images/train
+val: images/val
+test: images/test
+
+nc: 2
+names: ['leaf', 'damage']
+""")
+            
+            self.status_bar.showMessage('✅ Датасет разделен')
+            
+        except Exception as e:
+            self.split_result.append(f"❌ Ошибка: {str(e)}")
+            QMessageBox.critical(self, 'Ошибка', str(e))
+    
+    def start_training(self):
+        """Запуск обучения YOLO"""
+        if not YOLO_AVAILABLE:
+            QMessageBox.warning(self, 'Ошибка', 'Ultralytics не установлен. Выполните: pip install ultralytics')
+            return
+        
+        images_dir = self.images_dir.text()
+        labels_dir = self.labels_dir.text()
+        
+        if not images_dir or not labels_dir:
+            QMessageBox.warning(self, 'Ошибка', 'Укажите пути к изображениям и разметке')
+            return
+        
+        # Проверяем наличие YAML файла
+        yaml_path = "leaf_dataset.yaml"
+        if not os.path.exists(yaml_path):
+            # Создаем YAML файл
+            yaml_content = f"""
+path: ./dataset_yolo
+train: images/train
+val: images/val
+test: images/test
+
+nc: 2
+names: ['leaf', 'damage']
+"""
+            with open(yaml_path, 'w') as f:
+                f.write(yaml_content)
+            self.train_log.append(f"📄 Создан конфиг: {yaml_path}")
+        
+        # Запускаем обучение в отдельном потоке
+        self.train_thread = QThread()
+        self.train_worker = TrainingWorker(images_dir, labels_dir, self.epochs_spin.value())
+        self.train_worker.moveToThread(self.train_thread)
+        self.train_worker.progress.connect(self.on_training_progress)
+        self.train_worker.finished.connect(self.on_training_finished)
+        self.train_worker.error.connect(self.on_training_error)
+        self.train_thread.started.connect(self.train_worker.run)
+        self.train_thread.start()
+        
+        self.train_btn.setEnabled(False)
+        self.train_log.append("🚀 Запуск обучения YOLO...")
+        self.status_bar.showMessage('🔄 Обучение YOLO...')
+    
+    def on_training_progress(self, message):
+        """Обновление прогресса обучения"""
+        self.train_log.append(message)
+        # Автопрокрутка вниз
+        scrollbar = self.train_log.verticalScrollBar()
+        scrollbar.setValue(scrollbar.maximum())
+        QApplication.processEvents()
+    
+    def on_training_finished(self, model_path):
+        """Обучение завершено"""
+        self.train_btn.setEnabled(True)
+        self.train_log.append(f"\n✅ Обучение завершено!")
+        self.train_log.append(f"📁 Модель сохранена: {model_path}")
+        self.status_bar.showMessage(f'✅ Обучение завершено: {model_path}')
+        
+        # Обновляем анализатор
+        self.yolo_checkbox.setChecked(True)
+        QMessageBox.information(self, 'Обучение', f'Обучение завершено!\nМодель: {model_path}')
+    
+    def on_training_error(self, error_msg):
+        """Ошибка при обучении"""
+        self.train_btn.setEnabled(True)
+        self.train_log.append(f"\n❌ Ошибка: {error_msg}")
+        self.status_bar.showMessage('❌ Ошибка обучения')
+        QMessageBox.critical(self, 'Ошибка', error_msg)
+
+
+# ============================================================
+# ЧАСТЬ 5: ВСПОМОГАТЕЛЬНЫЙ КЛАСС ДЛЯ ОБУЧЕНИЯ В ПОТОКЕ
+# ============================================================
+
+class TrainingWorker(QObject):
+    progress = pyqtSignal(str)
+    finished = pyqtSignal(str)
+    error = pyqtSignal(str)
+    
+    def __init__(self, images_dir, labels_dir, epochs):
+        super().__init__()
+        self.images_dir = images_dir
+        self.labels_dir = labels_dir
+        self.epochs = epochs
+    
+    def run(self):
+        try:
+            self.progress.emit("📦 Подготовка датасета...")
+            
+            # Разделяем датасет
+            output_dir = "dataset_yolo"
+            DatasetSplitter.split_yolo_dataset(
+                self.images_dir, self.labels_dir, output_dir,
+                train_ratio=0.7, val_ratio=0.2, test_ratio=0.1
+            )
+            
+            # Создаем YAML конфиг
+            yaml_path = "leaf_dataset.yaml"
+            yaml_content = f"""
+path: ./{output_dir}
+train: images/train
+val: images/val
+test: images/test
+
+nc: 2
+names: ['leaf', 'damage']
+"""
+            with open(yaml_path, 'w') as f:
+                f.write(yaml_content)
+            
+            self.progress.emit("🚀 Загрузка модели YOLO...")
+            
+            # Загружаем модель
+            model = YOLO("yolo26n.pt")
+            
+            self.progress.emit(f"🏋️ Начало обучения на {self.epochs} эпох...")
+            
+            # Обучение
+            results = model.train(
+                data=yaml_path,
+                epochs=self.epochs,
+                imgsz=640,
+                batch=4,
+                device="cpu",
+                workers=0,
+                patience=20,
+                save=True,
+                project="runs/yolo26",
+                name="leaf_detection",
+                exist_ok=True,
+                verbose=False
+            )
+            
+            model_path = "runs/yolo26/leaf_detection/weights/best.pt"
+            self.progress.emit("✅ Модель сохранена!")
+            self.finished.emit(model_path)
+            
+        except Exception as e:
+            self.error.emit(str(e))
+
+
+# ============================================================
+# ЧАСТЬ 6: ЗАПУСК ПРИЛОЖЕНИЯ
+# ============================================================
+
+def main():
+    app = QApplication.instance()
+    if app is None:
+        app = QApplication(sys.argv)
+    
+    window = LeafDiseaseAnalyzerGUI()
+    window.show()
+    
+    # Проверка зависимостей
+    if not YOLO_AVAILABLE:
+        QMessageBox.warning(window, 'Предупреждение', 
+            'Ultralytics не установлен.\n\n'
+            'Для работы YOLO выполните:\n'
+            'pip install ultralytics\n\n'
+            'Анализатор будет работать в классическом режиме.')
+    
+    return app.exec_()
+
+
+if __name__ == '__main__':
+    # Проверка на запуск в IPython/Jupyter
+    try:
+        from IPython import get_ipython
+        if get_ipython() is not None:
+            print("=" * 60)
+            print("🍃 Leaf Disease Analyzer v6.0 (YOLO + CV)")
+            print("=" * 60)
+            print("🟢 Зеленый = здоровые участки")
+            print("🔴 Красный = повреждения")
+            print("🎯 YOLO = детекция листьев и повреждений")
+            print("=" * 60)
+            
+            import threading
+            def run_app():
+                app = QApplication.instance()
+                if app is None:
+                    app = QApplication(sys.argv)
+                window = LeafDiseaseAnalyzerGUI()
+                window.show()
+                app.exec_()
+            
+            thread = threading.Thread(target=run_app)
+            thread.daemon = True
+            thread.start()
+        else:
+            sys.exit(main())
+    except ImportError:
+        sys.exit(main())

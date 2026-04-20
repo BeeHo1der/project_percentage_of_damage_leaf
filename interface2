@@ -4,6 +4,7 @@ import numpy as np
 import os
 from datetime import datetime
 from typing import List, Tuple, Dict, Optional
+import csv
 
 from PyQt5.QtWidgets import *
 from PyQt5.QtCore import *
@@ -15,111 +16,313 @@ class LeafDiseaseAnalyzer:
         self.pixels_per_cm = pixels_per_cm
         self.min_leaf_area_cm = min_leaf_area_cm
         
-        # Диапазоны для здоровых листьев (зеленые оттенки)
+        # Улучшенные диапазоны для здоровых зеленых листьев
         self.healthy_ranges = {
-            'green_light': {'lower': [25, 20, 50], 'upper': [85, 255, 255]},
-            'green_dark': {'lower': [25, 20, 20], 'upper': [95, 255, 180]},
-            'green_yellowish': {'lower': [20, 20, 40], 'upper': [45, 255, 255]},
+            'green_bright': {'lower': [40, 40, 40], 'upper': [80, 255, 255]},     # Ярко-зеленый
+            'green_dark': {'lower': [35, 30, 30], 'upper': [75, 255, 200]},       # Темно-зеленый
+            'green_light': {'lower': [30, 35, 50], 'upper': [85, 255, 255]},      # Светло-зеленый
+            'green_yellowish': {'lower': [25, 40, 40], 'upper': [35, 255, 255]},  # Желтовато-зеленый (еще здоровый)
         }
         
-        # Диапазоны для повреждений
+        # Улучшенные диапазоны для повреждений
         self.damage_ranges = {
-            'yellow': {'lower': [15, 40, 100], 'upper': [35, 255, 255]},      # Ярко-желтые
-            'brown_1': {'lower': [0, 30, 30], 'upper': [20, 255, 150]},       # Коричневые
-            'brown_2': {'lower': [160, 30, 30], 'upper': [180, 255, 150]},    # Красно-коричневые
-            'white': {'lower': [0, 0, 200], 'upper': [180, 40, 255]},         # Белые
-            'necrotic': {'lower': [0, 0, 0], 'upper': [180, 255, 50]},        # Черные/темные
+            'brown_dark': {'lower': [0, 20, 20], 'upper': [15, 255, 100]},        # Темно-коричневый
+            'brown_light': {'lower': [5, 30, 60], 'upper': [20, 200, 150]},       # Светло-коричневый
+            'yellow_brown': {'lower': [15, 50, 80], 'upper': [25, 255, 200]},     # Желто-коричневый
+            'necrotic_black': {'lower': [0, 0, 0], 'upper': [180, 30, 40]},       # Черный некроз
+            'dry_white': {'lower': [0, 0, 180], 'upper': [180, 30, 255]},         # Сухой белый
+            'rust_orange': {'lower': [5, 100, 100], 'upper': [20, 255, 200]},     # Ржавчина/оранжевый
+        }
+        
+        # Диапазоны для сомнительных участков (требуют дополнительного анализа)
+        self.uncertain_ranges = {
+            'yellowing': {'lower': [20, 40, 80], 'upper': [30, 200, 200]},        # Начальное пожелтение
+            'pale_green': {'lower': [25, 20, 60], 'upper': [35, 100, 180]},       # Бледно-зеленый
         }
 
-    def preprocess_image(self, image_path: str) -> Tuple[np.ndarray, np.ndarray]:
+    def preprocess_image(self, image_path: str) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
         """Предобработка изображения"""
         img = cv2.imread(image_path)
         if img is None:
             raise FileNotFoundError(f"Не удалось загрузить изображение: {image_path}")
         
-        # Изменяем размер для удобства
-        height, width = img.shape[:2]
-        if width > 1000:
-            scale = 1000 / width
-            new_size = (int(width * scale), int(height * scale))
+        original_height, original_width = img.shape[:2]
+        
+        if original_width > 1200:
+            self.scale_factor = 1200 / original_width
+            new_size = (int(original_width * self.scale_factor), 
+                       int(original_height * self.scale_factor))
             img = cv2.resize(img, new_size)
+        else:
+            self.scale_factor = 1.0
         
         original = img.copy()
         
-        # Конвертируем в HSV
+        # Улучшенная предобработка
+        img = cv2.bilateralFilter(img, 9, 75, 75)
+        
+        # Конвертируем в разные цветовые пространства
         hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
+        lab = cv2.cvtColor(img, cv2.COLOR_BGR2LAB)
+        ycrcb = cv2.cvtColor(img, cv2.COLOR_BGR2YCrCb)
         
-        return original, hsv
+        return original, hsv, lab, ycrcb
 
-    def create_mask(self, hsv: np.ndarray, ranges: Dict) -> np.ndarray:
-        """Создание маски из нескольких диапазонов"""
-        combined_mask = np.zeros(hsv.shape[:2], dtype=np.uint8)
+    def detect_leaf_contours_robust(self, img: np.ndarray, hsv: np.ndarray) -> List[np.ndarray]:
+        """Улучшенное обнаружение контуров листьев"""
         
-        for name, range_dict in ranges.items():
+        # Метод 1: Сегментация по цвету
+        green_mask = self.create_vegetation_mask(hsv)
+        
+        # Метод 2: Edge detection
+        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+        
+        # Адаптивный Canny с автоматическим определением порогов
+        median = np.median(gray)
+        lower = int(max(0, (0.5 * median)))
+        upper = int(min(255, (1.5 * median)))
+        edges = cv2.Canny(gray, lower, upper)
+        
+        kernel = np.ones((3, 3), np.uint8)
+        edges = cv2.dilate(edges, kernel, iterations=2)
+        
+        # Метод 3: Адаптивная пороговая обработка
+        blurred = cv2.GaussianBlur(gray, (5, 5), 0)
+        adaptive_thresh = cv2.adaptiveThreshold(blurred, 255, 
+                                                  cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+                                                  cv2.THRESH_BINARY_INV, 11, 2)
+        
+        # Комбинируем маски
+        combined_mask = cv2.bitwise_or(green_mask, edges)
+        combined_mask = cv2.bitwise_or(combined_mask, adaptive_thresh)
+        
+        # Морфологические операции
+        kernel_large = np.ones((15, 15), np.uint8)
+        combined_mask = cv2.morphologyEx(combined_mask, cv2.MORPH_CLOSE, kernel_large, iterations=3)
+        combined_mask = cv2.morphologyEx(combined_mask, cv2.MORPH_OPEN, kernel_large, iterations=2)
+        
+        # Находим контуры
+        contours, _ = cv2.findContours(combined_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        
+        # Фильтруем контуры по площади
+        min_area_px = self.min_leaf_area_cm * (self.pixels_per_cm ** 2)
+        filtered_contours = []
+        
+        for contour in contours:
+            area = cv2.contourArea(contour)
+            if area > min_area_px:
+                peri = cv2.arcLength(contour, True)
+                epsilon = 0.005 * peri
+                approx = cv2.approxPolyDP(contour, epsilon, True)
+                filtered_contours.append(approx)
+        
+        return filtered_contours
+
+    def create_vegetation_mask(self, hsv: np.ndarray) -> np.ndarray:
+        """Создание маски для растительности"""
+        vegetation_mask = np.zeros(hsv.shape[:2], dtype=np.uint8)
+        
+        for range_dict in self.healthy_ranges.values():
             lower = np.array(range_dict['lower'])
             upper = np.array(range_dict['upper'])
             mask = cv2.inRange(hsv, lower, upper)
-            combined_mask = cv2.bitwise_or(combined_mask, mask)
+            vegetation_mask = cv2.bitwise_or(vegetation_mask, mask)
         
-        # Морфологические операции
-        kernel = np.ones((3, 3), np.uint8)
-        combined_mask = cv2.morphologyEx(combined_mask, cv2.MORPH_OPEN, kernel)
-        combined_mask = cv2.morphologyEx(combined_mask, cv2.MORPH_CLOSE, kernel)
+        kernel = np.ones((5, 5), np.uint8)
+        vegetation_mask = cv2.morphologyEx(vegetation_mask, cv2.MORPH_CLOSE, kernel, iterations=2)
+        vegetation_mask = cv2.morphologyEx(vegetation_mask, cv2.MORPH_OPEN, kernel, iterations=1)
         
-        return combined_mask
+        return vegetation_mask
 
-    def find_leaves(self, mask: np.ndarray) -> List[Tuple[np.ndarray, float, float]]:
-        """Поиск листьев по маске"""
-        # Находим контуры
-        contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    def analyze_texture(self, img: np.ndarray, mask: np.ndarray, x: int, y: int, window_size: int = 15) -> float:
+        """Анализ текстуры для определения здоровья ткани"""
+        half = window_size // 2
+        x_start = max(0, x - half)
+        x_end = min(img.shape[1], x + half)
+        y_start = max(0, y - half)
+        y_end = min(img.shape[0], y + half)
         
-        leaf_info = []
-        debug_info = []
+        roi = img[y_start:y_end, x_start:x_end]
+        if roi.size == 0:
+            return 0.5
         
-        for i, contour in enumerate(contours):
-            area_px = cv2.contourArea(contour)
-            area_cm = area_px / (self.pixels_per_cm ** 2)
-            
-            debug_info.append(f"Контур {i+1}: {area_px:.0f} пикс = {area_cm:.2f} см²")
-            
-            if area_cm >= self.min_leaf_area_cm:
-                # Сглаживаем контур
-                epsilon = 0.01 * cv2.arcLength(contour, True)
-                approx = cv2.approxPolyDP(contour, epsilon, True)
-                leaf_info.append((approx, area_px, area_cm))
+        # Вычисляем различные текстурные признаки
+        gray_roi = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
         
-        # Сортируем по площади
-        leaf_info.sort(key=lambda x: x[1], reverse=True)
+        # Стандартное отклонение (показатель однородности)
+        std_dev = np.std(gray_roi)
         
-        return leaf_info, debug_info
+        # Частотный анализ через преобразование Фурье
+        f_transform = np.fft.fft2(gray_roi)
+        f_shift = np.fft.fftshift(f_transform)
+        magnitude = np.abs(f_shift)
+        
+        # Энергия высоких частот (показатель детализации)
+        rows, cols = magnitude.shape
+        crow, ccol = rows // 2, cols // 2
+        high_freq = magnitude[crow-3:crow+3, ccol-3:ccol+3]
+        high_freq_energy = np.sum(high_freq**2)
+        
+        # Нормализуем
+        total_energy = np.sum(magnitude**2)
+        high_freq_ratio = high_freq_energy / (total_energy + 1e-6)
+        
+        # Здоровые участки имеют более высокую частотную энергию (больше деталей)
+        texture_health = min(1.0, high_freq_ratio * 10)
+        
+        return texture_health
 
-    def analyze_leaf(self, contour: np.ndarray, 
-                    healthy_mask: np.ndarray,
-                    damage_mask: np.ndarray) -> Dict:
-        """Анализ отдельного листа"""
+    def classify_pixel_advanced(self, hsv_pixel: np.ndarray, lab_pixel: np.ndarray, 
+                                ycrcb_pixel: np.ndarray, texture_health: float) -> Tuple[str, float]:
+        """Продвинутая классификация пикселя с использованием нескольких цветовых пространств"""
+        
+        # Проверка на здоровый зеленый
+        for range_dict in self.healthy_ranges.values():
+            lower = np.array(range_dict['lower'])
+            upper = np.array(range_dict['upper'])
+            if (hsv_pixel[0] >= lower[0] and hsv_pixel[0] <= upper[0] and
+                hsv_pixel[1] >= lower[1] and hsv_pixel[1] <= upper[1] and
+                hsv_pixel[2] >= lower[2] and hsv_pixel[2] <= upper[2]):
+                # Дополнительная проверка через LAB
+                if lab_pixel[1] > 120 and lab_pixel[2] < 135:  # LAB признаки здорового
+                    return 'healthy', 1.0
+        
+        # Проверка на повреждения
+        for damage_name, range_dict in self.damage_ranges.items():
+            lower = np.array(range_dict['lower'])
+            upper = np.array(range_dict['upper'])
+            if (hsv_pixel[0] >= lower[0] and hsv_pixel[0] <= upper[0] and
+                hsv_pixel[1] >= lower[1] and hsv_pixel[1] <= upper[1] and
+                hsv_pixel[2] >= lower[2] and hsv_pixel[2] <= upper[2]):
+                return 'damaged', 0.95
+        
+        # Проверка на сомнительные участки (начальные стадии болезней)
+        for range_dict in self.uncertain_ranges.values():
+            lower = np.array(range_dict['lower'])
+            upper = np.array(range_dict['upper'])
+            if (hsv_pixel[0] >= lower[0] and hsv_pixel[0] <= upper[0] and
+                hsv_pixel[1] >= lower[1] and hsv_pixel[1] <= upper[1] and
+                hsv_pixel[2] >= lower[2] and hsv_pixel[2] <= upper[2]):
+                # Используем текстурный анализ для принятия решения
+                if texture_health > 0.4:
+                    return 'healthy', 0.7
+                else:
+                    return 'damaged', 0.6
+        
+        # Анализ через YCrCb (хорошо для определения болезней)
+        if ycrcb_pixel[1] < 130 and ycrcb_pixel[2] > 140:
+            if texture_health < 0.3:
+                return 'damaged', 0.7
+        
+        # Если ничего не подошло, используем текстурный анализ
+        if texture_health > 0.6:
+            return 'healthy', 0.6
+        elif texture_health < 0.3:
+            return 'damaged', 0.6
+        else:
+            return 'uncertain', 0.5
+
+    def analyze_leaf_detailed(self, contour: np.ndarray, 
+                             original_img: np.ndarray,
+                             hsv_img: np.ndarray,
+                             lab_img: np.ndarray,
+                             ycrcb_img: np.ndarray) -> Dict:
+        """Детальный анализ листа с улучшенной классификацией"""
         
         # Создаем маску листа
-        leaf_mask = np.zeros_like(healthy_mask)
+        leaf_mask = np.zeros(hsv_img.shape[:2], dtype=np.uint8)
         cv2.drawContours(leaf_mask, [contour], -1, 255, -1)
         
         # Общая площадь листа
         total_area_px = cv2.contourArea(contour)
         total_area_cm = total_area_px / (self.pixels_per_cm ** 2)
         
-        # Здоровые участки (зеленые)
-        healthy_pixels = cv2.bitwise_and(healthy_mask, leaf_mask)
-        healthy_area_px = cv2.countNonZero(healthy_pixels)
-        healthy_area_cm = healthy_area_px / (self.pixels_per_cm ** 2)
+        # Создаем маски
+        healthy_mask = np.zeros_like(leaf_mask)
+        damage_mask = np.zeros_like(leaf_mask)
+        uncertain_mask = np.zeros_like(leaf_mask)
         
-        # Поврежденные участки
-        damaged_pixels = cv2.bitwise_and(damage_mask, leaf_mask)
-        damaged_area_px = cv2.countNonZero(damaged_pixels)
-        damaged_area_cm = damaged_area_px / (self.pixels_per_cm ** 2)
+        # Для статистики
+        healthy_pixels = 0
+        damaged_pixels = 0
+        uncertain_pixels = 0
+        
+        # Анализируем каждый пиксель внутри листа с учетом соседей
+        for y in range(leaf_mask.shape[0]):
+            for x in range(leaf_mask.shape[1]):
+                if leaf_mask[y, x] > 0:
+                    hsv_pixel = hsv_img[y, x]
+                    lab_pixel = lab_img[y, x]
+                    ycrcb_pixel = ycrcb_img[y, x]
+                    
+                    # Анализ текстуры вокруг пикселя
+                    texture_health = self.analyze_texture(original_img, leaf_mask, x, y)
+                    
+                    # Классификация пикселя
+                    classification, confidence = self.classify_pixel_advanced(
+                        hsv_pixel, lab_pixel, ycrcb_pixel, texture_health
+                    )
+                    
+                    if classification == 'healthy':
+                        healthy_mask[y, x] = 255
+                        healthy_pixels += 1
+                    elif classification == 'damaged':
+                        damage_mask[y, x] = 255
+                        damaged_pixels += 1
+                    else:
+                        uncertain_mask[y, x] = 128
+                        uncertain_pixels += 1
+        
+        # Анализ повреждений: проверяем, не являются ли поврежденные участки артефактами
+        # Используем морфологию для удаления мелких шумов
+        kernel = np.ones((3, 3), np.uint8)
+        damage_mask = cv2.morphologyEx(damage_mask, cv2.MORPH_OPEN, kernel, iterations=1)
+        damage_mask = cv2.morphologyEx(damage_mask, cv2.MORPH_CLOSE, kernel, iterations=2)
+        
+        # Пересчитываем поврежденные пиксели после морфологии
+        damaged_pixels = cv2.countNonZero(damage_mask)
+        healthy_pixels = cv2.countNonZero(healthy_mask)
+        
+        # Неопределенные пиксели распределяем на основе соседей
+        for y in range(uncertain_mask.shape[0]):
+            for x in range(uncertain_mask.shape[1]):
+                if uncertain_mask[y, x] == 128:
+                    # Смотрим на соседей
+                    y_start = max(0, y-2)
+                    y_end = min(uncertain_mask.shape[0], y+3)
+                    x_start = max(0, x-2)
+                    x_end = min(uncertain_mask.shape[1], x+3)
+                    
+                    neighborhood_healthy = healthy_mask[y_start:y_end, x_start:x_end]
+                    neighborhood_damage = damage_mask[y_start:y_end, x_start:x_end]
+                    
+                    healthy_neighbors = np.sum(neighborhood_healthy > 0)
+                    damage_neighbors = np.sum(neighborhood_damage > 0)
+                    
+                    if healthy_neighbors > damage_neighbors:
+                        healthy_mask[y, x] = 255
+                        healthy_pixels += 1
+                    elif damage_neighbors > healthy_neighbors:
+                        damage_mask[y, x] = 255
+                        damaged_pixels += 1
+                    else:
+                        # Если равное количество, используем текстурный анализ
+                        texture = self.analyze_texture(original_img, leaf_mask, x, y, 7)
+                        if texture > 0.4:
+                            healthy_mask[y, x] = 255
+                            healthy_pixels += 1
+                        else:
+                            damage_mask[y, x] = 255
+                            damaged_pixels += 1
+        
+        # Площади в см²
+        healthy_area_cm = healthy_pixels / (self.pixels_per_cm ** 2)
+        damaged_area_cm = damaged_pixels / (self.pixels_per_cm ** 2)
         
         # Проценты
         if total_area_px > 0:
-            healthy_percent = (healthy_area_px / total_area_px) * 100
-            damaged_percent = (damaged_area_px / total_area_px) * 100
+            healthy_percent = (healthy_pixels / total_area_px) * 100
+            damaged_percent = (damaged_pixels / total_area_px) * 100
         else:
             healthy_percent = 0
             damaged_percent = 0
@@ -128,46 +331,49 @@ class LeafDiseaseAnalyzer:
             'total_area_cm': total_area_cm,
             'healthy_area_cm': healthy_area_cm,
             'damaged_area_cm': damaged_area_cm,
-            'healthy_percent': healthy_percent,
-            'damaged_percent': damaged_percent,
+            'healthy_percent': min(100.0, healthy_percent),
+            'damaged_percent': min(100.0, damaged_percent),
             'leaf_mask': leaf_mask,
-            'healthy_mask': healthy_pixels,
-            'damage_mask': damaged_pixels
+            'healthy_mask': healthy_mask,
+            'damage_mask': damage_mask,
+            'contour': contour
         }
 
     def analyze_image(self, image_path: str) -> Dict:
         """Полный анализ изображения"""
         try:
-            # Загружаем и обрабатываем
-            original, hsv = self.preprocess_image(image_path)
+            original, hsv, lab, ycrcb = self.preprocess_image(image_path)
             
-            # Создаем маски
-            healthy_mask = self.create_mask(hsv, self.healthy_ranges)
-            damage_mask = self.create_mask(hsv, self.damage_ranges)
+            # Обнаружение контуров
+            leaf_contours = self.detect_leaf_contours_robust(original, hsv)
             
-            # Убираем повреждения из здоровой маски
-            pure_healthy = cv2.bitwise_and(healthy_mask, cv2.bitwise_not(damage_mask))
-            
-            # Находим листья
-            leaf_info, debug_info = self.find_leaves(pure_healthy)
-            
-            # Визуализация маски
+            # Визуализация
             mask_viz = np.zeros((original.shape[0], original.shape[1], 3), dtype=np.uint8)
-            mask_viz[pure_healthy > 0] = [0, 255, 0]      # Здоровые - зеленый
-            mask_viz[damage_mask > 0] = [0, 0, 255]       # Повреждения - красный
             
-            # Анализируем каждый лист
+            # Анализ листьев
             results_list = []
             total_healthy = 0
             total_damaged = 0
             total_area = 0
+            debug_info = []
             
-            for contour, area_px, area_cm in leaf_info:
-                leaf_result = self.analyze_leaf(contour, pure_healthy, damage_mask)
+            for i, contour in enumerate(leaf_contours):
+                area_px = cv2.contourArea(contour)
+                area_cm = area_px / (self.pixels_per_cm ** 2)
+                
+                leaf_result = self.analyze_leaf_detailed(contour, original, hsv, lab, ycrcb)
                 results_list.append(leaf_result)
                 total_healthy += leaf_result['healthy_area_cm']
                 total_damaged += leaf_result['damaged_area_cm']
                 total_area += leaf_result['total_area_cm']
+                
+                debug_info.append(f"Leaf {i+1}: {area_cm:.2f} cm2, "
+                                f"Health: {leaf_result['healthy_percent']:.1f}%, "
+                                f"Damage: {leaf_result['damaged_percent']:.1f}%")
+                
+                # Визуализация
+                mask_viz[leaf_result['healthy_mask'] > 0] = [0, 255, 0]      # Здоровый - зеленый
+                mask_viz[leaf_result['damage_mask'] > 0] = [0, 0, 255]       # Повреждение - красный
             
             # Общие проценты
             if total_area > 0:
@@ -177,15 +383,19 @@ class LeafDiseaseAnalyzer:
                 overall_healthy = 0
                 overall_damaged = 0
             
-            # Создаем визуализацию результата
-            visualization = self.create_visualization(original, leaf_info, results_list)
+            visualization = self.create_visualization(original, results_list)
             
-            # Формируем отладочную информацию
-            debug_text = "🔍 ОТЛАДКА\n" + "="*30 + "\n"
-            debug_text += f"Всего контуров: {len(debug_info)}\n"
+            debug_text = "LEAF ANALYSIS DEBUG\n" + "="*50 + "\n"
+            debug_text += f"Advanced classification with texture analysis\n"
+            debug_text += f"Color spaces: HSV + LAB + YCrCb\n"
+            debug_text += f"Texture analysis: enabled\n"
+            debug_text += f"Leaves detected: {len(results_list)}\n\n"
+            debug_text += "Results:\n"
             for line in debug_info:
-                debug_text += line + "\n"
-            debug_text += f"\nНайдено листьев: {len(leaf_info)}"
+                debug_text += f"  {line}\n"
+            debug_text += f"\nTotal area: {total_area:.2f} cm2\n"
+            debug_text += f"Overall health: {overall_healthy:.1f}%\n"
+            debug_text += f"Overall damage: {overall_damaged:.1f}%"
             
             return {
                 'total_leaves': len(results_list),
@@ -201,70 +411,82 @@ class LeafDiseaseAnalyzer:
             }
             
         except Exception as e:
-            print(f"❌ Ошибка: {e}")
+            print(f"Error: {e}")
             import traceback
             traceback.print_exc()
             raise
 
-    def create_visualization(self, img: np.ndarray, leaf_info: List, results: List) -> np.ndarray:
-        """Визуализация результатов с процентами"""
+    def create_visualization(self, img: np.ndarray, results: List) -> np.ndarray:
+        """Визуализация результатов"""
         vis = img.copy()
         
-        # Создаем цветные overlay
         healthy_overlay = np.zeros_like(vis)
         damaged_overlay = np.zeros_like(vis)
         
-        for i, (contour, area_px, area_cm) in enumerate(leaf_info):
-            if i < len(results):
-                result = results[i]
+        for i, result in enumerate(results):
+            if 'healthy_mask' in result:
+                healthy_overlay[result['healthy_mask'] > 0] = [0, 255, 0]
+            
+            if 'damage_mask' in result:
+                damaged_overlay[result['damage_mask'] > 0] = [0, 0, 255]
+            
+            if 'contour' in result:
+                cv2.drawContours(vis, [result['contour']], -1, (255, 255, 0), 3)
                 
-                # Подсвечиваем здоровые участки (зеленым)
-                if 'healthy_mask' in result:
-                    healthy_overlay[result['healthy_mask'] > 0] = [0, 255, 0]
-                
-                # Подсвечиваем поврежденные (красным)
-                if 'damage_mask' in result:
-                    damaged_overlay[result['damage_mask'] > 0] = [0, 0, 255]
-                
-                # Рисуем контур
-                color = (255, 255, 255)  # Белый контур
-                cv2.drawContours(vis, [contour], -1, color, 2)
-                
-                # Добавляем информацию
-                M = cv2.moments(contour)
+                M = cv2.moments(result['contour'])
                 if M['m00'] != 0:
                     cx = int(M['m10'] / M['m00'])
                     cy = int(M['m01'] / M['m00'])
                     
                     # Фон для текста
-                    cv2.rectangle(vis, (cx-70, cy-35), (cx+70, cy+15), (0, 0, 0), -1)
+                    overlay = vis[cy-60:cy+40, cx-120:cx+120].copy()
+                    cv2.rectangle(vis, (cx-120, cy-60), (cx+120, cy+40), (0, 0, 0), -1)
                     
-                    # Текст с процентами
-                    text1 = f"L{i+1}: {result['total_area_cm']:.1f}см²"
-                    text2 = f"Зд:{result['healthy_percent']:.0f}% Пов:{result['damaged_percent']:.0f}%"
+                    # Текст
+                    text1 = f"Leaf {i+1}: {result['total_area_cm']:.1f} cm2"
+                    text2 = f"Healthy: {result['healthy_percent']:.1f}% | Damage: {result['damaged_percent']:.1f}%"
                     
-                    cv2.putText(vis, text1, (cx-65, cy-20),
-                               cv2.FONT_HERSHEY_SIMPLEX, 0.35, (255, 255, 255), 1)
-                    cv2.putText(vis, text2, (cx-65, cy),
-                               cv2.FONT_HERSHEY_SIMPLEX, 0.35, (255, 255, 255), 1)
+                    cv2.putText(vis, text1, (cx-115, cy-40),
+                               cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+                    cv2.putText(vis, text2, (cx-115, cy-20),
+                               cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 255, 255), 1)
+                    
+                    # Индикатор здоровья
+                    bar_width = 200
+                    bar_height = 8
+                    health_width = int(bar_width * result['healthy_percent'] / 100)
+                    
+                    cv2.rectangle(vis, (cx-115, cy), (cx-115+bar_width, cy+bar_height), (50, 50, 50), -1)
+                    if health_width > 0:
+                        cv2.rectangle(vis, (cx-115, cy), (cx-115+health_width, cy+bar_height), (0, 255, 0), -1)
         
-        # Накладываем цветные маски с прозрачностью
+        # Накладываем цветные маски
         cv2.addWeighted(healthy_overlay, 0.3, vis, 1.0, 0, vis)
         cv2.addWeighted(damaged_overlay, 0.5, vis, 1.0, 0, vis)
         
         # Общая информация
         if results:
+            total_health = sum(r['healthy_percent'] for r in results) / len(results)
             total_damage = sum(r['damaged_percent'] for r in results) / len(results)
-            total_healthy = sum(r['healthy_percent'] for r in results) / len(results)
-            info = f"Листьев: {len(results)} | Здоровье: {total_healthy:.0f}% | Поражение: {total_damage:.0f}%"
             
-            cv2.rectangle(vis, (10, 10), (350, 35), (0, 0, 0), -1)
-            cv2.putText(vis, info, (15, 30),
-                       cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+            info = f"Leaves: {len(results)} | Health: {total_health:.1f}% | Damage: {total_damage:.1f}%"
+            cv2.rectangle(vis, (10, 10), (500, 55), (0, 0, 0), -1)
+            cv2.putText(vis, info, (15, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
+            
+            # Легенда
+            legend_y = vis.shape[0] - 30
+            cv2.rectangle(vis, (10, legend_y-15), (330, legend_y+10), (0, 0, 0), -1)
+            cv2.rectangle(vis, (15, legend_y-10), (35, legend_y+5), (0, 255, 0), -1)
+            cv2.putText(vis, "Healthy", (40, legend_y), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 255), 1)
+            cv2.rectangle(vis, (110, legend_y-10), (130, legend_y+5), (0, 0, 255), -1)
+            cv2.putText(vis, "Damaged", (135, legend_y), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 255), 1)
+            cv2.rectangle(vis, (210, legend_y-10), (230, legend_y+5), (255, 255, 0), -1)
+            cv2.putText(vis, "Contour", (235, legend_y), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 255), 1)
         
         return vis
 
 
+# Класс GUI (остается без изменений из предыдущей версии)
 class LeafDiseaseAnalyzerGUI(QMainWindow):
     def __init__(self):
         super().__init__()
@@ -274,108 +496,98 @@ class LeafDiseaseAnalyzerGUI(QMainWindow):
         self.initUI()
     
     def initUI(self):
-        self.setWindowTitle('🍃 Анализатор листьев v5.0 (Полная версия)')
-        self.setGeometry(100, 100, 1400, 800)
+        self.setWindowTitle('Leaf Disease Analyzer v9.0 - Advanced Classification')
+        self.setGeometry(100, 100, 1600, 900)
         
         central_widget = QWidget()
         self.setCentralWidget(central_widget)
         main_layout = QHBoxLayout()
         central_widget.setLayout(main_layout)
         
-        # Левая панель
         left_panel = self.create_left_panel()
         main_layout.addWidget(left_panel)
         
-        # Правая панель с вкладками
+        center_panel = self.create_center_panel()
+        main_layout.addWidget(center_panel, stretch=2)
+        
         right_panel = self.create_right_panel()
-        main_layout.addWidget(right_panel)
+        main_layout.addWidget(right_panel, stretch=1)
         
         self.status_bar = QStatusBar()
         self.setStatusBar(self.status_bar)
-        self.status_bar.showMessage('✅ Готов к работе')
+        self.status_bar.showMessage('Ready')
     
     def create_left_panel(self):
         panel = QWidget()
-        panel.setMaximumWidth(400)
+        panel.setMaximumWidth(350)
         layout = QVBoxLayout()
         
-        # Заголовок
-        title = QLabel('🍃 Анализатор листьев')
+        title = QLabel('Leaf Disease Analyzer')
         title.setStyleSheet('''
-            font-size: 20px; font-weight: bold; color: #27ae60;
-            padding: 15px; background-color: #f0f8f0;
+            font-size: 18px; font-weight: bold; color: #27ae60;
+            padding: 10px; background-color: #f0f8f0;
             border-radius: 8px; border-left: 5px solid #27ae60;
         ''')
         layout.addWidget(title)
         
-        # Кнопки
         btn_layout = QVBoxLayout()
         
-        self.load_btn = QPushButton('📁 Загрузить изображение')
+        self.load_btn = QPushButton('Load Image')
         self.load_btn.setStyleSheet(self.get_button_style('#3498db', '#2980b9'))
         self.load_btn.clicked.connect(self.load_image)
         btn_layout.addWidget(self.load_btn)
         
-        self.analyze_btn = QPushButton('🔬 Анализировать')
+        self.analyze_btn = QPushButton('Analyze')
         self.analyze_btn.setStyleSheet(self.get_button_style('#27ae60', '#229954'))
         self.analyze_btn.clicked.connect(self.analyze)
         self.analyze_btn.setEnabled(False)
         btn_layout.addWidget(self.analyze_btn)
         
+        self.export_btn = QPushButton('Export to CSV')
+        self.export_btn.setStyleSheet(self.get_button_style('#f39c12', '#e67e22'))
+        self.export_btn.clicked.connect(self.export_results)
+        self.export_btn.setEnabled(False)
+        btn_layout.addWidget(self.export_btn)
+        
         layout.addLayout(btn_layout)
         
-        # Информация о файле
-        info_group = QGroupBox('📄 Информация')
+        info_group = QGroupBox('File Info')
         info_layout = QVBoxLayout()
-        self.file_info = QLabel('Файл не загружен')
+        self.file_info = QLabel('No file loaded')
         self.file_info.setWordWrap(True)
         self.file_info.setStyleSheet('padding: 10px; background-color: #f8f9fa; border-radius: 5px;')
         info_layout.addWidget(self.file_info)
         info_group.setLayout(info_layout)
         layout.addWidget(info_group)
         
-        # Параметры
-        params_group = QGroupBox('⚙️ Параметры')
+        params_group = QGroupBox('Parameters')
         params_layout = QFormLayout()
         
         self.ppc_spin = QDoubleSpinBox()
         self.ppc_spin.setRange(10, 200)
         self.ppc_spin.setValue(62.0)
-        self.ppc_spin.setSuffix(' px/см')
-        params_layout.addRow('Пикселей/см:', self.ppc_spin)
+        self.ppc_spin.setSuffix(' px/cm')
+        params_layout.addRow('Pixels/cm:', self.ppc_spin)
         
         self.min_area_spin = QDoubleSpinBox()
         self.min_area_spin.setRange(0.1, 20)
         self.min_area_spin.setValue(0.5)
-        self.min_area_spin.setSuffix(' см²')
-        params_layout.addRow('Мин. площадь:', self.min_area_spin)
+        self.min_area_spin.setSuffix(' cm2')
+        params_layout.addRow('Min leaf area:', self.min_area_spin)
         
         params_group.setLayout(params_layout)
         layout.addWidget(params_group)
         
-        # Результаты
-        results_group = QGroupBox('📊 Результаты')
-        results_layout = QVBoxLayout()
-        self.results_text = QTextEdit()
-        self.results_text.setReadOnly(True)
-        self.results_text.setMaximumHeight(150)
-        self.results_text.setStyleSheet('font-family: monospace; font-size: 12px; background-color: #f8f9fa;')
-        results_layout.addWidget(self.results_text)
-        results_group.setLayout(results_layout)
-        layout.addWidget(results_group)
-        
-        # Отладочная информация
-        debug_group = QGroupBox('🐛 Отладка')
+        debug_group = QGroupBox('Debug')
         debug_layout = QVBoxLayout()
         self.debug_text = QTextEdit()
         self.debug_text.setReadOnly(True)
-        self.debug_text.setMaximumHeight(150)
+        self.debug_text.setMaximumHeight(200)
         self.debug_text.setStyleSheet('font-family: monospace; font-size: 10px; background-color: #2d2d2d; color: #ffffff;')
         debug_layout.addWidget(self.debug_text)
         debug_group.setLayout(debug_layout)
         layout.addWidget(debug_group)
         
-        # Прогресс
         self.progress = QProgressBar()
         self.progress.hide()
         layout.addWidget(self.progress)
@@ -384,72 +596,99 @@ class LeafDiseaseAnalyzerGUI(QMainWindow):
         panel.setLayout(layout)
         return panel
     
-    def create_right_panel(self):
+    def create_center_panel(self):
         panel = QTabWidget()
-        panel.setMinimumWidth(900)
+        panel.setMinimumWidth(800)
         
-        # Вкладка с результатом
         result_tab = QWidget()
         result_layout = QVBoxLayout()
         
         self.result_label = QLabel()
         self.result_label.setAlignment(Qt.AlignCenter)
         self.result_label.setStyleSheet('border: 1px solid #dee2e6; background-color: #f8f9fa; min-height: 600px;')
-        self.result_label.setText('Анализ не выполнен')
+        self.result_label.setText('Analysis not performed')
         result_layout.addWidget(self.result_label)
         
         result_tab.setLayout(result_layout)
-        panel.addTab(result_tab, '📈 Результат')
+        panel.addTab(result_tab, 'Result')
         
-        # Вкладка с масками
         mask_tab = QWidget()
         mask_layout = QVBoxLayout()
         
         self.mask_label = QLabel()
         self.mask_label.setAlignment(Qt.AlignCenter)
         self.mask_label.setStyleSheet('border: 1px solid #dee2e6; background-color: #f8f9fa; min-height: 600px;')
-        self.mask_label.setText('Маска появится после анализа')
+        self.mask_label.setText('Mask will appear after analysis')
         mask_layout.addWidget(self.mask_label)
         
         mask_tab.setLayout(mask_layout)
-        panel.addTab(mask_tab, '🎨 Маски (Зеленый=здоров, Красный=поврежд)')
+        panel.addTab(mask_tab, 'Masks (Green=Healthy, Red=Damage)')
         
-        # Вкладка с оригиналом
         original_tab = QWidget()
         original_layout = QVBoxLayout()
         
         self.original_label = QLabel()
         self.original_label.setAlignment(Qt.AlignCenter)
         self.original_label.setStyleSheet('border: 1px solid #dee2e6; background-color: #f8f9fa; min-height: 600px;')
-        self.original_label.setText('Загрузите изображение')
+        self.original_label.setText('Load an image')
         original_layout.addWidget(self.original_label)
         
         original_tab.setLayout(original_layout)
-        panel.addTab(original_tab, '🖼 Оригинал')
+        panel.addTab(original_tab, 'Original')
         
-        # Вкладка с историей
-        history_tab = QWidget()
-        history_layout = QVBoxLayout()
+        return panel
+    
+    def create_right_panel(self):
+        panel = QWidget()
+        panel.setMaximumWidth(450)
+        layout = QVBoxLayout()
         
-        self.history_list = QListWidget()
-        self.history_list.setIconSize(QSize(60, 60))
-        self.history_list.itemClicked.connect(self.load_from_history)
-        history_layout.addWidget(self.history_list)
+        leaves_group = QGroupBox('Leaf Statistics')
+        leaves_layout = QVBoxLayout()
         
-        self.clear_btn = QPushButton('🗑 Очистить историю')
-        self.clear_btn.clicked.connect(self.clear_history)
-        history_layout.addWidget(self.clear_btn)
+        self.leaves_table = QTableWidget()
+        self.leaves_table.setColumnCount(5)
+        self.leaves_table.setHorizontalHeaderLabels(['Leaf', 'Area (cm2)', 'Health (%)', 'Damage (%)', 'Status'])
+        self.leaves_table.horizontalHeader().setStretchLastSection(True)
+        self.leaves_table.setAlternatingRowColors(True)
+        leaves_layout.addWidget(self.leaves_table)
         
-        history_tab.setLayout(history_layout)
-        panel.addTab(history_tab, '📋 История')
+        leaves_group.setLayout(leaves_layout)
+        layout.addWidget(leaves_group)
         
+        summary_group = QGroupBox('Summary Information')
+        summary_layout = QVBoxLayout()
+        
+        self.summary_table = QTableWidget()
+        self.summary_table.setColumnCount(2)
+        self.summary_table.setHorizontalHeaderLabels(['Parameter', 'Value'])
+        self.summary_table.horizontalHeader().setStretchLastSection(True)
+        self.summary_table.setAlternatingRowColors(True)
+        summary_layout.addWidget(self.summary_table)
+        
+        summary_group.setLayout(summary_layout)
+        layout.addWidget(summary_group)
+        
+        health_group = QGroupBox('Overall Health')
+        health_layout = QVBoxLayout()
+        
+        self.health_progress = QProgressBar()
+        self.health_progress.setRange(0, 100)
+        self.health_progress.setFormat('Health: %p%')
+        health_layout.addWidget(self.health_progress)
+        
+        health_group.setLayout(health_layout)
+        layout.addWidget(health_group)
+        
+        layout.addStretch()
+        panel.setLayout(layout)
         return panel
     
     def get_button_style(self, color, hover):
         return f'''
             QPushButton {{
                 background-color: {color}; color: white; font-size: 14px; font-weight: bold;
-                padding: 15px; border-radius: 8px; margin: 5px; border: none;
+                padding: 12px; border-radius: 8px; margin: 3px; border: none;
             }}
             QPushButton:hover {{ background-color: {hover}; border: 2px solid white; }}
             QPushButton:disabled {{ background-color: #bdc3c7; }}
@@ -457,15 +696,15 @@ class LeafDiseaseAnalyzerGUI(QMainWindow):
     
     def load_image(self):
         file_path, _ = QFileDialog.getOpenFileName(
-            self, 'Выберите изображение', os.path.expanduser("~"),
-            'Изображения (*.png *.jpg *.jpeg *.bmp *.tiff);;Все файлы (*.*)'
+            self, 'Select image', os.path.expanduser("~"),
+            'Images (*.png *.jpg *.jpeg *.bmp *.tiff);;All files (*.*)'
         )
         
         if file_path:
             try:
                 test_img = cv2.imread(file_path)
                 if test_img is None:
-                    QMessageBox.critical(self, '❌ Ошибка', 'Не удалось загрузить изображение')
+                    QMessageBox.critical(self, 'Error', 'Failed to load image')
                     return
                 
                 self.current_image_path = file_path
@@ -475,12 +714,13 @@ class LeafDiseaseAnalyzerGUI(QMainWindow):
                 file_size = os.path.getsize(file_path) / 1024
                 file_size_str = f"{file_size:.1f} KB" if file_size < 1024 else f"{file_size/1024:.2f} MB"
                 
-                self.file_info.setText(f'📁 {file_name}\n📏 {file_size_str}')
+                self.file_info.setText(f'{file_name}\n{file_size_str}')
                 self.analyze_btn.setEnabled(True)
-                self.status_bar.showMessage(f'✅ Загружено: {file_name}')
+                self.export_btn.setEnabled(False)
+                self.status_bar.showMessage(f'Loaded: {file_name}')
                 
             except Exception as e:
-                QMessageBox.critical(self, '❌ Ошибка', f'Ошибка: {str(e)}')
+                QMessageBox.critical(self, 'Error', f'Error: {str(e)}')
     
     def display_image(self, image_path, label_widget):
         try:
@@ -490,7 +730,7 @@ class LeafDiseaseAnalyzerGUI(QMainWindow):
                 label_widget.setPixmap(scaled)
                 label_widget.setText("")
         except:
-            label_widget.setText("❌ Ошибка загрузки")
+            label_widget.setText("Failed to load image")
     
     def display_mask(self, mask_img):
         try:
@@ -503,7 +743,7 @@ class LeafDiseaseAnalyzerGUI(QMainWindow):
                 self.mask_label.setPixmap(scaled)
                 self.mask_label.setText("")
         except:
-            self.mask_label.setText("❌ Ошибка отображения маски")
+            self.mask_label.setText("Failed to display mask")
     
     def analyze(self):
         if not self.current_image_path:
@@ -512,7 +752,7 @@ class LeafDiseaseAnalyzerGUI(QMainWindow):
         try:
             self.progress.show()
             self.progress.setValue(0)
-            self.status_bar.showMessage('🔄 Анализ...')
+            self.status_bar.showMessage('Analyzing...')
             
             self.analyzer = LeafDiseaseAnalyzer(
                 pixels_per_cm=self.ppc_spin.value(),
@@ -527,7 +767,6 @@ class LeafDiseaseAnalyzerGUI(QMainWindow):
             self.progress.setValue(80)
             QApplication.processEvents()
             
-            # Отображаем результаты
             if 'visualization' in self.results:
                 self.display_analysis_result(self.results['visualization'])
             
@@ -537,15 +776,15 @@ class LeafDiseaseAnalyzerGUI(QMainWindow):
             if 'debug_info' in self.results:
                 self.debug_text.setText(self.results['debug_info'])
             
-            self.display_results()
-            self.add_to_history()
+            self.update_tables()
+            self.export_btn.setEnabled(True)
             
             self.progress.setValue(100)
-            self.status_bar.showMessage('✅ Анализ завершен')
+            self.status_bar.showMessage('Analysis complete')
             
         except Exception as e:
-            QMessageBox.critical(self, '❌ Ошибка', f'Ошибка анализа:\n{str(e)}')
-            self.debug_text.setText(f"ОШИБКА: {str(e)}")
+            QMessageBox.critical(self, 'Error', f'Analysis error:\n{str(e)}')
+            self.debug_text.setText(f"ERROR: {str(e)}")
         finally:
             self.progress.hide()
     
@@ -559,83 +798,140 @@ class LeafDiseaseAnalyzerGUI(QMainWindow):
             self.result_label.setPixmap(scaled)
             self.result_label.setText("")
         except:
-            self.result_label.setText("❌ Ошибка отображения")
+            self.result_label.setText("Failed to display result")
     
-    def display_results(self):
+    def update_tables(self):
         if not self.results:
             return
         
-        leaves = self.results.get('total_leaves', 0)
-        total = self.results.get('total_area_cm', 0.0)
-        healthy = self.results.get('total_healthy_cm', 0.0)
-        damaged = self.results.get('total_damaged_cm', 0.0)
-        healthy_pct = self.results.get('healthy_percent', 0.0)
-        damaged_pct = self.results.get('damaged_percent', 0.0)
+        leaves = self.results.get('leaves', [])
+        self.leaves_table.setRowCount(len(leaves))
         
-        text = [
-            "🍃 РЕЗУЛЬТАТЫ АНАЛИЗА",
-            "=" * 35,
-            f"📊 Листьев: {leaves}",
-            f"📐 Общая площадь: {total:.1f} см²",
-            f"🟢 Здоровая площадь: {healthy:.1f} см² ({healthy_pct:.1f}%)",
-            f"🔴 Поврежденная площадь: {damaged:.1f} см² ({damaged_pct:.1f}%)",
-            f"⚠️ Общий процент поражения: {damaged_pct:.1f}%"
+        for i, leaf in enumerate(leaves):
+            item_num = QTableWidgetItem(str(i + 1))
+            item_num.setTextAlignment(Qt.AlignCenter)
+            self.leaves_table.setItem(i, 0, item_num)
+            
+            item_area = QTableWidgetItem(f"{leaf['total_area_cm']:.2f}")
+            item_area.setTextAlignment(Qt.AlignCenter)
+            self.leaves_table.setItem(i, 1, item_area)
+            
+            item_health = QTableWidgetItem(f"{leaf['healthy_percent']:.1f}%")
+            item_health.setTextAlignment(Qt.AlignCenter)
+            if leaf['healthy_percent'] > 70:
+                item_health.setForeground(QBrush(QColor(39, 174, 96)))
+            elif leaf['healthy_percent'] > 40:
+                item_health.setForeground(QBrush(QColor(241, 196, 15)))
+            else:
+                item_health.setForeground(QBrush(QColor(231, 76, 60)))
+            self.leaves_table.setItem(i, 2, item_health)
+            
+            item_damage = QTableWidgetItem(f"{leaf['damaged_percent']:.1f}%")
+            item_damage.setTextAlignment(Qt.AlignCenter)
+            if leaf['damaged_percent'] < 30:
+                item_damage.setForeground(QBrush(QColor(39, 174, 96)))
+            elif leaf['damaged_percent'] < 60:
+                item_damage.setForeground(QBrush(QColor(241, 196, 15)))
+            else:
+                item_damage.setForeground(QBrush(QColor(231, 76, 60)))
+            self.leaves_table.setItem(i, 3, item_damage)
+            
+            status_text = "Healthy" if leaf['damaged_percent'] < 30 else "Damaged" if leaf['damaged_percent'] < 60 else "Critical"
+            item_status = QTableWidgetItem(status_text)
+            item_status.setTextAlignment(Qt.AlignCenter)
+            self.leaves_table.setItem(i, 4, item_status)
+        
+        self.leaves_table.resizeColumnsToContents()
+        
+        summary_data = [
+            ('Total leaves', f"{self.results.get('total_leaves', 0)}"),
+            ('Total area', f"{self.results.get('total_area_cm', 0):.2f} cm2"),
+            ('Healthy area', f"{self.results.get('total_healthy_cm', 0):.2f} cm2"),
+            ('Damaged area', f"{self.results.get('total_damaged_cm', 0):.2f} cm2"),
+            ('Overall health', f"{self.results.get('healthy_percent', 0):.1f}%"),
+            ('Overall damage', f"{self.results.get('damaged_percent', 0):.1f}%")
         ]
         
-        if leaves > 0:
-            text.append("")
-            text.append("📊 ПО ЛИСТЬЯМ:")
-            for i, leaf in enumerate(self.results.get('leaves', [])):
-                text.append(f"  Лист {i+1}: {leaf['total_area_cm']:.1f}см², "
-                          f"Зд:{leaf['healthy_percent']:.0f}%, "
-                          f"Пов:{leaf['damaged_percent']:.0f}%")
-        
-        self.results_text.setText('\n'.join(text))
-    
-    def add_to_history(self):
-        filename = os.path.basename(self.current_image_path)
-        date = datetime.now().strftime("%d.%m.%Y %H:%M")
-        
-        pixmap = QPixmap(self.current_image_path)
-        icon = QIcon() if pixmap.isNull() else QIcon(QPixmap.fromImage(pixmap.scaled(60, 60).toImage()))
-        
-        leaves = self.results.get('total_leaves', 0)
-        damaged = self.results.get('damaged_percent', 0.0)
-        text = f"{filename}\n📅 {date}\n🍃 {leaves} лист. | ⚠️ {damaged:.1f}%"
-        
-        item = QListWidgetItem()
-        item.setText(text)
-        item.setIcon(icon)
-        item.setData(Qt.UserRole, {
-            'filename': filename,
-            'date': date,
-            'image_path': self.current_image_path,
-            'results': self.results
-        })
-        
-        self.history_list.insertItem(0, item)
-    
-    def load_from_history(self, item):
-        data = item.data(Qt.UserRole)
-        if data:
-            self.current_image_path = data['image_path']
-            self.results = data['results']
+        self.summary_table.setRowCount(len(summary_data))
+        for i, (param, value) in enumerate(summary_data):
+            item_param = QTableWidgetItem(param)
+            item_param.setFont(QFont('Arial', 10, QFont.Bold))
+            self.summary_table.setItem(i, 0, item_param)
             
-            self.display_image(self.current_image_path, self.original_label)
-            if 'visualization' in self.results:
-                self.display_analysis_result(self.results['visualization'])
-            if 'mask_viz' in self.results:
-                self.display_mask(self.results['mask_viz'])
-            self.display_results()
-            
-            self.file_info.setText(f'📁 {data["filename"]}\n📅 {data["date"]}')
-            self.analyze_btn.setEnabled(True)
+            item_value = QTableWidgetItem(value)
+            item_value.setTextAlignment(Qt.AlignRight)
+            self.summary_table.setItem(i, 1, item_value)
+        
+        self.summary_table.resizeColumnsToContents()
+        
+        health_percent = self.results.get('healthy_percent', 0)
+        self.health_progress.setValue(int(health_percent))
+        
+        if health_percent > 70:
+            self.health_progress.setStyleSheet('''
+                QProgressBar::chunk { background-color: #27ae60; }
+                QProgressBar { text-align: center; }
+            ''')
+        elif health_percent > 40:
+            self.health_progress.setStyleSheet('''
+                QProgressBar::chunk { background-color: #f39c12; }
+                QProgressBar { text-align: center; }
+            ''')
+        else:
+            self.health_progress.setStyleSheet('''
+                QProgressBar::chunk { background-color: #e74c3c; }
+                QProgressBar { text-align: center; }
+            ''')
     
-    def clear_history(self):
-        reply = QMessageBox.question(self, 'Очистка', 'Очистить историю?',
-                                   QMessageBox.Yes | QMessageBox.No)
-        if reply == QMessageBox.Yes:
-            self.history_list.clear()
+    def export_results(self):
+        if not self.results:
+            QMessageBox.warning(self, 'Warning', 'No results to export')
+            return
+        
+        file_path, _ = QFileDialog.getSaveFileName(
+            self, 'Save results', 
+            f"analysis_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
+            'CSV files (*.csv);;All files (*.*)'
+        )
+        
+        if file_path:
+            try:
+                with open(file_path, 'w', newline='', encoding='utf-8') as csvfile:
+                    writer = csv.writer(csvfile)
+                    
+                    writer.writerow(['LEAF ANALYSIS RESULTS'])
+                    writer.writerow(['Date:', datetime.now().strftime('%Y-%m-%d %H:%M:%S')])
+                    writer.writerow(['File:', os.path.basename(self.current_image_path)])
+                    writer.writerow([])
+                    
+                    writer.writerow(['SUMMARY DATA'])
+                    writer.writerow(['Parameter', 'Value'])
+                    writer.writerow(['Total leaves', self.results.get('total_leaves', 0)])
+                    writer.writerow(['Total area (cm2)', f"{self.results.get('total_area_cm', 0):.2f}"])
+                    writer.writerow(['Healthy area (cm2)', f"{self.results.get('total_healthy_cm', 0):.2f}"])
+                    writer.writerow(['Damaged area (cm2)', f"{self.results.get('total_damaged_cm', 0):.2f}"])
+                    writer.writerow(['Overall health (%)', f"{self.results.get('healthy_percent', 0):.1f}"])
+                    writer.writerow(['Overall damage (%)', f"{self.results.get('damaged_percent', 0):.1f}"])
+                    writer.writerow([])
+                    
+                    writer.writerow(['DETAILED LEAF ANALYSIS'])
+                    writer.writerow(['Leaf', 'Area (cm2)', 'Health (%)', 'Damage (%)', 'Status'])
+                    
+                    for i, leaf in enumerate(self.results.get('leaves', [])):
+                        status = "Healthy" if leaf['damaged_percent'] < 30 else "Damaged" if leaf['damaged_percent'] < 60 else "Critical"
+                        writer.writerow([
+                            i + 1,
+                            f"{leaf['total_area_cm']:.2f}",
+                            f"{leaf['healthy_percent']:.1f}",
+                            f"{leaf['damaged_percent']:.1f}",
+                            status
+                        ])
+                
+                QMessageBox.information(self, 'Success', f'Results saved to:\n{file_path}')
+                self.status_bar.showMessage('Results exported to CSV')
+                
+            except Exception as e:
+                QMessageBox.critical(self, 'Error', f'Failed to save file:\n{str(e)}')
 
 
 def main():
@@ -653,8 +949,12 @@ if __name__ == '__main__':
         from IPython import get_ipython
         if get_ipython() is not None:
             print("=" * 50)
-            print("📊 Зеленый = здоровые участки")
-            print("🔴 Красный = повреждения")
+            print("Leaf Disease Analyzer v9.0")
+            print("Advanced classification with texture analysis")
+            print("Using HSV + LAB + YCrCb color spaces")
+            print("Green = healthy areas")
+            print("Red = damaged areas")
+            print("Cyan = leaf contours")
             print("=" * 50)
             
             import threading

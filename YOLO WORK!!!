@@ -1,0 +1,1112 @@
+import sys
+import cv2
+import numpy as np
+import os
+from datetime import datetime
+from typing import List, Tuple, Dict, Optional
+import csv
+from pathlib import Path
+
+from PyQt5.QtWidgets import *
+from PyQt5.QtCore import *
+from PyQt5.QtGui import *
+
+# Попытка импорта YOLO
+try:
+    from ultralytics import YOLO
+    YOLO_AVAILABLE = True
+except ImportError:
+    YOLO_AVAILABLE = False
+    print("Warning: Ultralytics YOLO not installed. Install with: pip install ultralytics")
+
+
+class LeafDiseaseAnalyzer:
+    def __init__(self, pixels_per_cm: float = 62.0, min_leaf_area_cm: float = 1.0, 
+                 yolo_model_path: str = None):
+        self.pixels_per_cm = pixels_per_cm
+        self.min_leaf_area_cm = min_leaf_area_cm
+        
+        # Инициализация YOLO модели
+        self.yolo_model = None
+        if YOLO_AVAILABLE and yolo_model_path and os.path.exists(yolo_model_path):
+            try:
+                self.yolo_model = YOLO(yolo_model_path)
+                print(f"YOLO model loaded from {yolo_model_path}")
+            except Exception as e:
+                print(f"Failed to load YOLO model: {e}")
+        
+        # Улучшенные диапазоны для здоровых зеленых листьев
+        self.healthy_ranges = {
+            'green_bright': {'lower': [40, 40, 40], 'upper': [80, 255, 255]},
+            'green_dark': {'lower': [35, 30, 30], 'upper': [75, 255, 200]},
+            'green_light': {'lower': [30, 35, 50], 'upper': [85, 255, 255]},
+            'green_yellowish': {'lower': [25, 40, 40], 'upper': [35, 255, 255]},
+        }
+        
+        # Улучшенные диапазоны для повреждений
+        self.damage_ranges = {
+            'brown_dark': {'lower': [0, 20, 20], 'upper': [15, 255, 100]},
+            'brown_light': {'lower': [5, 30, 60], 'upper': [20, 200, 150]},
+            'yellow_brown': {'lower': [15, 50, 80], 'upper': [25, 255, 200]},
+            'necrotic_black': {'lower': [0, 0, 0], 'upper': [180, 30, 40]},
+            'dry_white': {'lower': [0, 0, 180], 'upper': [180, 30, 255]},
+            'rust_orange': {'lower': [5, 100, 100], 'upper': [20, 255, 200]},
+        }
+        
+        # Диапазоны для сомнительных участков
+        self.uncertain_ranges = {
+            'yellowing': {'lower': [20, 40, 80], 'upper': [30, 200, 200]},
+            'pale_green': {'lower': [25, 20, 60], 'upper': [35, 100, 180]},
+        }
+        
+        # Маппинг классов YOLO (из data.yaml)
+        self.yolo_classes = {
+            0: 'erozia',      # Эрозия/повреждения
+            1: 'leaf',        # Лист
+            2: 'list'         # Лист (альтернативное название)
+        }
+
+    def detect_leaves_with_yolo(self, img: np.ndarray) -> List[np.ndarray]:
+        """Обнаружение листьев с помощью YOLO"""
+        if self.yolo_model is None:
+            return []
+        
+        try:
+            # Запуск инференса
+            results = self.yolo_model(img, verbose=False)
+            
+            leaf_contours = []
+            
+            for result in results:
+                if result.boxes is not None:
+                    for box in result.boxes:
+                        # Получаем класс объекта
+                        class_id = int(box.cls[0])
+                        class_name = self.yolo_classes.get(class_id, 'unknown')
+                        
+                        # Нас интересуют только листья (классы 1 и 2)
+                        if class_name in ['leaf', 'list']:
+                            # Получаем координаты bounding box
+                            x1, y1, x2, y2 = map(int, box.xyxy[0])
+                            
+                            # Создаем контур из bounding box
+                            contour = np.array([
+                                [x1, y1],
+                                [x2, y1],
+                                [x2, y2],
+                                [x1, y2]
+                            ], dtype=np.int32)
+                            
+                            # Уточняем контур с помощью сегментации
+                            refined_contour = self.refine_contour_with_mask(img, contour)
+                            leaf_contours.append(refined_contour)
+            
+            return leaf_contours
+            
+        except Exception as e:
+            print(f"YOLO detection error: {e}")
+            return []
+
+    def refine_contour_with_mask(self, img: np.ndarray, bbox_contour: np.ndarray) -> np.ndarray:
+        """Уточнение контура листа внутри bounding box с использованием GrabCut"""
+        x, y, w, h = cv2.boundingRect(bbox_contour)
+        
+        # Добавляем небольшой отступ
+        margin = 10
+        x = max(0, x - margin)
+        y = max(0, y - margin)
+        w = min(img.shape[1] - x, w + 2 * margin)
+        h = min(img.shape[0] - y, h + 2 * margin)
+        
+        # Применяем GrabCut для точного выделения
+        mask = np.zeros(img.shape[:2], np.uint8)
+        bgd_model = np.zeros((1, 65), np.float64)
+        fgd_model = np.zeros((1, 65), np.float64)
+        
+        rect = (x, y, w, h)
+        
+        try:
+            cv2.grabCut(img, mask, rect, bgd_model, fgd_model, 5, cv2.GC_INIT_WITH_RECT)
+            
+            # Создаем маску
+            refined_mask = np.where((mask == cv2.GC_FGD) | (mask == cv2.GC_PR_FGD), 255, 0).astype(np.uint8)
+            
+            # Находим контуры
+            contours, _ = cv2.findContours(refined_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            
+            if contours:
+                # Берем самый большой контур
+                largest = max(contours, key=cv2.contourArea)
+                # Сглаживаем
+                peri = cv2.arcLength(largest, True)
+                epsilon = 0.005 * peri
+                return cv2.approxPolyDP(largest, epsilon, True)
+        except:
+            pass
+        
+        return bbox_contour
+
+    def preprocess_image(self, image_path: str) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+        """Предобработка изображения"""
+        img = cv2.imread(image_path)
+        if img is None:
+            raise FileNotFoundError(f"Не удалось загрузить изображение: {image_path}")
+        
+        original_height, original_width = img.shape[:2]
+        
+        if original_width > 1200:
+            self.scale_factor = 1200 / original_width
+            new_size = (int(original_width * self.scale_factor), 
+                       int(original_height * self.scale_factor))
+            img = cv2.resize(img, new_size)
+        else:
+            self.scale_factor = 1.0
+        
+        original = img.copy()
+        
+        # Улучшенная предобработка
+        img = cv2.bilateralFilter(img, 9, 75, 75)
+        
+        # Конвертируем в разные цветовые пространства
+        hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
+        lab = cv2.cvtColor(img, cv2.COLOR_BGR2LAB)
+        ycrcb = cv2.cvtColor(img, cv2.COLOR_BGR2YCrCb)
+        
+        return original, hsv, lab, ycrcb
+
+    def detect_leaf_contours_robust(self, img: np.ndarray, hsv: np.ndarray) -> List[np.ndarray]:
+        """Улучшенное обнаружение контуров листьев с использованием YOLO"""
+        
+        leaf_contours = []
+        
+        # Метод 1: Используем YOLO если доступен
+        if self.yolo_model is not None:
+            yolo_contours = self.detect_leaves_with_yolo(img)
+            if yolo_contours:
+                leaf_contours.extend(yolo_contours)
+                print(f"YOLO detected {len(yolo_contours)} leaves")
+        
+        # Метод 2: Традиционные методы компьютерного зрения (как fallback или дополнение)
+        # Сегментация по цвету
+        green_mask = self.create_vegetation_mask(hsv)
+        
+        # Edge detection
+        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+        median = np.median(gray)
+        lower = int(max(0, (0.5 * median)))
+        upper = int(min(255, (1.5 * median)))
+        edges = cv2.Canny(gray, lower, upper)
+        
+        kernel = np.ones((3, 3), np.uint8)
+        edges = cv2.dilate(edges, kernel, iterations=2)
+        
+        # Адаптивная пороговая обработка
+        blurred = cv2.GaussianBlur(gray, (5, 5), 0)
+        adaptive_thresh = cv2.adaptiveThreshold(blurred, 255, 
+                                                  cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+                                                  cv2.THRESH_BINARY_INV, 11, 2)
+        
+        # Комбинируем маски
+        combined_mask = cv2.bitwise_or(green_mask, edges)
+        combined_mask = cv2.bitwise_or(combined_mask, adaptive_thresh)
+        
+        # Морфологические операции
+        kernel_large = np.ones((15, 15), np.uint8)
+        combined_mask = cv2.morphologyEx(combined_mask, cv2.MORPH_CLOSE, kernel_large, iterations=3)
+        combined_mask = cv2.morphologyEx(combined_mask, cv2.MORPH_OPEN, kernel_large, iterations=2)
+        
+        # Находим контуры
+        contours, _ = cv2.findContours(combined_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        
+        # Фильтруем контуры по площади
+        min_area_px = self.min_leaf_area_cm * (self.pixels_per_cm ** 2)
+        
+        for contour in contours:
+            area = cv2.contourArea(contour)
+            if area > min_area_px:
+                # Проверяем, не дублирует ли этот контур уже найденный YOLO
+                is_duplicate = False
+                for existing in leaf_contours:
+                    existing_area = cv2.contourArea(existing)
+                    if abs(area - existing_area) / max(area, existing_area) < 0.3:
+                        # Проверяем перекрытие
+                        rect1 = cv2.boundingRect(contour)
+                        rect2 = cv2.boundingRect(existing)
+                        if self.rectangles_overlap(rect1, rect2, 0.5):
+                            is_duplicate = True
+                            break
+                
+                if not is_duplicate:
+                    peri = cv2.arcLength(contour, True)
+                    epsilon = 0.005 * peri
+                    approx = cv2.approxPolyDP(contour, epsilon, True)
+                    leaf_contours.append(approx)
+        
+        return leaf_contours
+    
+    def rectangles_overlap(self, rect1, rect2, threshold=0.5):
+        """Проверка перекрытия двух прямоугольников"""
+        x1, y1, w1, h1 = rect1
+        x2, y2, w2, h2 = rect2
+        
+        # Вычисляем пересечение
+        x_overlap = max(0, min(x1 + w1, x2 + w2) - max(x1, x2))
+        y_overlap = max(0, min(y1 + h1, y2 + h2) - max(y1, y2))
+        overlap_area = x_overlap * y_overlap
+        
+        area1 = w1 * h1
+        area2 = w2 * h2
+        
+        overlap_ratio = overlap_area / min(area1, area2)
+        return overlap_ratio > threshold
+
+    def create_vegetation_mask(self, hsv: np.ndarray) -> np.ndarray:
+        """Создание маски для растительности"""
+        vegetation_mask = np.zeros(hsv.shape[:2], dtype=np.uint8)
+        
+        for range_dict in self.healthy_ranges.values():
+            lower = np.array(range_dict['lower'])
+            upper = np.array(range_dict['upper'])
+            mask = cv2.inRange(hsv, lower, upper)
+            vegetation_mask = cv2.bitwise_or(vegetation_mask, mask)
+        
+        kernel = np.ones((5, 5), np.uint8)
+        vegetation_mask = cv2.morphologyEx(vegetation_mask, cv2.MORPH_CLOSE, kernel, iterations=2)
+        vegetation_mask = cv2.morphologyEx(vegetation_mask, cv2.MORPH_OPEN, kernel, iterations=1)
+        
+        return vegetation_mask
+
+    def analyze_texture(self, img: np.ndarray, mask: np.ndarray, x: int, y: int, window_size: int = 15) -> float:
+        """Анализ текстуры для определения здоровья ткани"""
+        half = window_size // 2
+        x_start = max(0, x - half)
+        x_end = min(img.shape[1], x + half)
+        y_start = max(0, y - half)
+        y_end = min(img.shape[0], y + half)
+        
+        roi = img[y_start:y_end, x_start:x_end]
+        if roi.size == 0:
+            return 0.5
+        
+        gray_roi = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
+        std_dev = np.std(gray_roi)
+        
+        # Частотный анализ
+        f_transform = np.fft.fft2(gray_roi)
+        f_shift = np.fft.fftshift(f_transform)
+        magnitude = np.abs(f_shift)
+        
+        rows, cols = magnitude.shape
+        crow, ccol = rows // 2, cols // 2
+        high_freq = magnitude[crow-3:crow+3, ccol-3:ccol+3]
+        high_freq_energy = np.sum(high_freq**2)
+        
+        total_energy = np.sum(magnitude**2)
+        high_freq_ratio = high_freq_energy / (total_energy + 1e-6)
+        
+        texture_health = min(1.0, high_freq_ratio * 10)
+        
+        return texture_health
+
+    def classify_pixel_advanced(self, hsv_pixel: np.ndarray, lab_pixel: np.ndarray, 
+                                ycrcb_pixel: np.ndarray, texture_health: float) -> Tuple[str, float]:
+        """Продвинутая классификация пикселя"""
+        
+        for range_dict in self.healthy_ranges.values():
+            lower = np.array(range_dict['lower'])
+            upper = np.array(range_dict['upper'])
+            if (hsv_pixel[0] >= lower[0] and hsv_pixel[0] <= upper[0] and
+                hsv_pixel[1] >= lower[1] and hsv_pixel[1] <= upper[1] and
+                hsv_pixel[2] >= lower[2] and hsv_pixel[2] <= upper[2]):
+                if lab_pixel[1] > 120 and lab_pixel[2] < 135:
+                    return 'healthy', 1.0
+        
+        for damage_name, range_dict in self.damage_ranges.items():
+            lower = np.array(range_dict['lower'])
+            upper = np.array(range_dict['upper'])
+            if (hsv_pixel[0] >= lower[0] and hsv_pixel[0] <= upper[0] and
+                hsv_pixel[1] >= lower[1] and hsv_pixel[1] <= upper[1] and
+                hsv_pixel[2] >= lower[2] and hsv_pixel[2] <= upper[2]):
+                return 'damaged', 0.95
+        
+        for range_dict in self.uncertain_ranges.values():
+            lower = np.array(range_dict['lower'])
+            upper = np.array(range_dict['upper'])
+            if (hsv_pixel[0] >= lower[0] and hsv_pixel[0] <= upper[0] and
+                hsv_pixel[1] >= lower[1] and hsv_pixel[1] <= upper[1] and
+                hsv_pixel[2] >= lower[2] and hsv_pixel[2] <= upper[2]):
+                if texture_health > 0.4:
+                    return 'healthy', 0.7
+                else:
+                    return 'damaged', 0.6
+        
+        if ycrcb_pixel[1] < 130 and ycrcb_pixel[2] > 140:
+            if texture_health < 0.3:
+                return 'damaged', 0.7
+        
+        if texture_health > 0.6:
+            return 'healthy', 0.6
+        elif texture_health < 0.3:
+            return 'damaged', 0.6
+        else:
+            return 'uncertain', 0.5
+
+    def analyze_leaf_detailed(self, contour: np.ndarray, 
+                             original_img: np.ndarray,
+                             hsv_img: np.ndarray,
+                             lab_img: np.ndarray,
+                             ycrcb_img: np.ndarray) -> Dict:
+        """Детальный анализ листа"""
+        
+        leaf_mask = np.zeros(hsv_img.shape[:2], dtype=np.uint8)
+        cv2.drawContours(leaf_mask, [contour], -1, 255, -1)
+        
+        total_area_px = cv2.contourArea(contour)
+        total_area_cm = total_area_px / (self.pixels_per_cm ** 2)
+        
+        healthy_mask = np.zeros_like(leaf_mask)
+        damage_mask = np.zeros_like(leaf_mask)
+        uncertain_mask = np.zeros_like(leaf_mask)
+        
+        healthy_pixels = 0
+        damaged_pixels = 0
+        
+        for y in range(leaf_mask.shape[0]):
+            for x in range(leaf_mask.shape[1]):
+                if leaf_mask[y, x] > 0:
+                    hsv_pixel = hsv_img[y, x]
+                    lab_pixel = lab_img[y, x]
+                    ycrcb_pixel = ycrcb_img[y, x]
+                    
+                    texture_health = self.analyze_texture(original_img, leaf_mask, x, y)
+                    
+                    classification, confidence = self.classify_pixel_advanced(
+                        hsv_pixel, lab_pixel, ycrcb_pixel, texture_health
+                    )
+                    
+                    if classification == 'healthy':
+                        healthy_mask[y, x] = 255
+                        healthy_pixels += 1
+                    elif classification == 'damaged':
+                        damage_mask[y, x] = 255
+                        damaged_pixels += 1
+                    else:
+                        uncertain_mask[y, x] = 128
+        
+        kernel = np.ones((3, 3), np.uint8)
+        damage_mask = cv2.morphologyEx(damage_mask, cv2.MORPH_OPEN, kernel, iterations=1)
+        damage_mask = cv2.morphologyEx(damage_mask, cv2.MORPH_CLOSE, kernel, iterations=2)
+        
+        damaged_pixels = cv2.countNonZero(damage_mask)
+        healthy_pixels = cv2.countNonZero(healthy_mask)
+        
+        for y in range(uncertain_mask.shape[0]):
+            for x in range(uncertain_mask.shape[1]):
+                if uncertain_mask[y, x] == 128:
+                    y_start = max(0, y-2)
+                    y_end = min(uncertain_mask.shape[0], y+3)
+                    x_start = max(0, x-2)
+                    x_end = min(uncertain_mask.shape[1], x+3)
+                    
+                    neighborhood_healthy = healthy_mask[y_start:y_end, x_start:x_end]
+                    neighborhood_damage = damage_mask[y_start:y_end, x_start:x_end]
+                    
+                    healthy_neighbors = np.sum(neighborhood_healthy > 0)
+                    damage_neighbors = np.sum(neighborhood_damage > 0)
+                    
+                    if healthy_neighbors > damage_neighbors:
+                        healthy_mask[y, x] = 255
+                        healthy_pixels += 1
+                    elif damage_neighbors > healthy_neighbors:
+                        damage_mask[y, x] = 255
+                        damaged_pixels += 1
+                    else:
+                        texture = self.analyze_texture(original_img, leaf_mask, x, y, 7)
+                        if texture > 0.4:
+                            healthy_mask[y, x] = 255
+                            healthy_pixels += 1
+                        else:
+                            damage_mask[y, x] = 255
+                            damaged_pixels += 1
+        
+        healthy_area_cm = healthy_pixels / (self.pixels_per_cm ** 2)
+        damaged_area_cm = damaged_pixels / (self.pixels_per_cm ** 2)
+        
+        if total_area_px > 0:
+            healthy_percent = (healthy_pixels / total_area_px) * 100
+            damaged_percent = (damaged_pixels / total_area_px) * 100
+        else:
+            healthy_percent = 0
+            damaged_percent = 0
+        
+        return {
+            'total_area_cm': total_area_cm,
+            'healthy_area_cm': healthy_area_cm,
+            'damaged_area_cm': damaged_area_cm,
+            'healthy_percent': min(100.0, healthy_percent),
+            'damaged_percent': min(100.0, damaged_percent),
+            'leaf_mask': leaf_mask,
+            'healthy_mask': healthy_mask,
+            'damage_mask': damage_mask,
+            'contour': contour
+        }
+
+    def analyze_image(self, image_path: str) -> Dict:
+        """Полный анализ изображения"""
+        try:
+            original, hsv, lab, ycrcb = self.preprocess_image(image_path)
+            
+            leaf_contours = self.detect_leaf_contours_robust(original, hsv)
+            
+            mask_viz = np.zeros((original.shape[0], original.shape[1], 3), dtype=np.uint8)
+            
+            results_list = []
+            total_healthy = 0
+            total_damaged = 0
+            total_area = 0
+            debug_info = []
+            
+            detection_method = "YOLO + CV" if self.yolo_model else "Computer Vision only"
+            debug_info.append(f"Detection method: {detection_method}")
+            
+            for i, contour in enumerate(leaf_contours):
+                area_px = cv2.contourArea(contour)
+                area_cm = area_px / (self.pixels_per_cm ** 2)
+                
+                leaf_result = self.analyze_leaf_detailed(contour, original, hsv, lab, ycrcb)
+                results_list.append(leaf_result)
+                total_healthy += leaf_result['healthy_area_cm']
+                total_damaged += leaf_result['damaged_area_cm']
+                total_area += leaf_result['total_area_cm']
+                
+                debug_info.append(f"Leaf {i+1}: {area_cm:.2f} cm2, "
+                                f"Health: {leaf_result['healthy_percent']:.1f}%, "
+                                f"Damage: {leaf_result['damaged_percent']:.1f}%")
+                
+                mask_viz[leaf_result['healthy_mask'] > 0] = [0, 255, 0]
+                mask_viz[leaf_result['damage_mask'] > 0] = [0, 0, 255]
+            
+            if total_area > 0:
+                overall_healthy = (total_healthy / total_area) * 100
+                overall_damaged = (total_damaged / total_area) * 100
+            else:
+                overall_healthy = 0
+                overall_damaged = 0
+            
+            visualization = self.create_visualization(original, results_list)
+            
+            debug_text = "LEAF ANALYSIS DEBUG\n" + "="*50 + "\n"
+            debug_text += f"Detection: {detection_method}\n"
+            debug_text += f"YOLO available: {self.yolo_model is not None}\n"
+            debug_text += f"Leaves detected: {len(results_list)}\n\n"
+            for line in debug_info:
+                debug_text += f"  {line}\n"
+            debug_text += f"\nTotal area: {total_area:.2f} cm2\n"
+            debug_text += f"Overall health: {overall_healthy:.1f}%\n"
+            debug_text += f"Overall damage: {overall_damaged:.1f}%"
+            
+            return {
+                'total_leaves': len(results_list),
+                'leaves': results_list,
+                'total_area_cm': total_area,
+                'total_healthy_cm': total_healthy,
+                'total_damaged_cm': total_damaged,
+                'healthy_percent': overall_healthy,
+                'damaged_percent': overall_damaged,
+                'debug_info': debug_text,
+                'visualization': visualization,
+                'mask_viz': mask_viz
+            }
+            
+        except Exception as e:
+            print(f"Error: {e}")
+            import traceback
+            traceback.print_exc()
+            raise
+
+    def create_visualization(self, img: np.ndarray, results: List) -> np.ndarray:
+        """Визуализация результатов"""
+        vis = img.copy()
+        
+        healthy_overlay = np.zeros_like(vis)
+        damaged_overlay = np.zeros_like(vis)
+        
+        for i, result in enumerate(results):
+            if 'healthy_mask' in result:
+                healthy_overlay[result['healthy_mask'] > 0] = [0, 255, 0]
+            
+            if 'damage_mask' in result:
+                damaged_overlay[result['damage_mask'] > 0] = [0, 0, 255]
+            
+            if 'contour' in result:
+                cv2.drawContours(vis, [result['contour']], -1, (255, 255, 0), 3)
+                
+                M = cv2.moments(result['contour'])
+                if M['m00'] != 0:
+                    cx = int(M['m10'] / M['m00'])
+                    cy = int(M['m01'] / M['m00'])
+                    
+                    cv2.rectangle(vis, (cx-120, cy-60), (cx+120, cy+40), (0, 0, 0), -1)
+                    
+                    text1 = f"Leaf {i+1}: {result['total_area_cm']:.1f} cm2"
+                    text2 = f"Healthy: {result['healthy_percent']:.1f}% | Damage: {result['damaged_percent']:.1f}%"
+                    
+                    cv2.putText(vis, text1, (cx-115, cy-40),
+                               cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+                    cv2.putText(vis, text2, (cx-115, cy-20),
+                               cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 255, 255), 1)
+                    
+                    bar_width = 200
+                    bar_height = 8
+                    health_width = int(bar_width * result['healthy_percent'] / 100)
+                    
+                    cv2.rectangle(vis, (cx-115, cy), (cx-115+bar_width, cy+bar_height), (50, 50, 50), -1)
+                    if health_width > 0:
+                        cv2.rectangle(vis, (cx-115, cy), (cx-115+health_width, cy+bar_height), (0, 255, 0), -1)
+        
+        cv2.addWeighted(healthy_overlay, 0.3, vis, 1.0, 0, vis)
+        cv2.addWeighted(damaged_overlay, 0.5, vis, 1.0, 0, vis)
+        
+        if results:
+            total_health = sum(r['healthy_percent'] for r in results) / len(results)
+            total_damage = sum(r['damaged_percent'] for r in results) / len(results)
+            
+            info = f"Leaves: {len(results)} | Health: {total_health:.1f}% | Damage: {total_damage:.1f}%"
+            cv2.rectangle(vis, (10, 10), (500, 55), (0, 0, 0), -1)
+            cv2.putText(vis, info, (15, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
+            
+            legend_y = vis.shape[0] - 30
+            cv2.rectangle(vis, (10, legend_y-15), (330, legend_y+10), (0, 0, 0), -1)
+            cv2.rectangle(vis, (15, legend_y-10), (35, legend_y+5), (0, 255, 0), -1)
+            cv2.putText(vis, "Healthy", (40, legend_y), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 255), 1)
+            cv2.rectangle(vis, (110, legend_y-10), (130, legend_y+5), (0, 0, 255), -1)
+            cv2.putText(vis, "Damaged", (135, legend_y), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 255), 1)
+            cv2.rectangle(vis, (210, legend_y-10), (230, legend_y+5), (255, 255, 0), -1)
+            cv2.putText(vis, "Contour", (235, legend_y), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 255), 1)
+        
+        return vis
+
+
+class LeafDiseaseAnalyzerGUI(QMainWindow):
+    def __init__(self):
+        super().__init__()
+        self.analyzer = None
+        self.current_image_path = None
+        self.results = None
+        self.yolo_model_path = None
+        self.initUI()
+    
+    def initUI(self):
+        self.setWindowTitle('Leaf Disease Analyzer v10.0 - YOLO Integration')
+        self.setGeometry(100, 100, 1600, 900)
+        
+        central_widget = QWidget()
+        self.setCentralWidget(central_widget)
+        main_layout = QHBoxLayout()
+        central_widget.setLayout(main_layout)
+        
+        left_panel = self.create_left_panel()
+        main_layout.addWidget(left_panel)
+        
+        center_panel = self.create_center_panel()
+        main_layout.addWidget(center_panel, stretch=2)
+        
+        right_panel = self.create_right_panel()
+        main_layout.addWidget(right_panel, stretch=1)
+        
+        self.status_bar = QStatusBar()
+        self.setStatusBar(self.status_bar)
+        self.status_bar.showMessage('Ready')
+    
+    def create_left_panel(self):
+        panel = QWidget()
+        panel.setMaximumWidth(350)
+        layout = QVBoxLayout()
+        
+        title = QLabel('Leaf Disease Analyzer')
+        title.setStyleSheet('''
+            font-size: 18px; font-weight: bold; color: #27ae60;
+            padding: 10px; background-color: #f0f8f0;
+            border-radius: 8px; border-left: 5px solid #27ae60;
+        ''')
+        layout.addWidget(title)
+        
+        btn_layout = QVBoxLayout()
+        
+        self.load_btn = QPushButton('Load Image')
+        self.load_btn.setStyleSheet(self.get_button_style('#3498db', '#2980b9'))
+        self.load_btn.clicked.connect(self.load_image)
+        btn_layout.addWidget(self.load_btn)
+        
+        self.load_model_btn = QPushButton('Load YOLO Model')
+        self.load_model_btn.setStyleSheet(self.get_button_style('#9b59b6', '#8e44ad'))
+        self.load_model_btn.clicked.connect(self.load_yolo_model)
+        btn_layout.addWidget(self.load_model_btn)
+        
+        self.analyze_btn = QPushButton('Analyze')
+        self.analyze_btn.setStyleSheet(self.get_button_style('#27ae60', '#229954'))
+        self.analyze_btn.clicked.connect(self.analyze)
+        self.analyze_btn.setEnabled(False)
+        btn_layout.addWidget(self.analyze_btn)
+        
+        self.export_btn = QPushButton('Export to CSV')
+        self.export_btn.setStyleSheet(self.get_button_style('#f39c12', '#e67e22'))
+        self.export_btn.clicked.connect(self.export_results)
+        self.export_btn.setEnabled(False)
+        btn_layout.addWidget(self.export_btn)
+        
+        layout.addLayout(btn_layout)
+        
+        info_group = QGroupBox('File Info')
+        info_layout = QVBoxLayout()
+        self.file_info = QLabel('No file loaded')
+        self.file_info.setWordWrap(True)
+        self.file_info.setStyleSheet('padding: 10px; background-color: #f8f9fa; border-radius: 5px;')
+        info_layout.addWidget(self.file_info)
+        info_group.setLayout(info_layout)
+        layout.addWidget(info_group)
+        
+        model_group = QGroupBox('YOLO Model')
+        model_layout = QVBoxLayout()
+        self.model_info = QLabel('No model loaded\nLoad a YOLO model for better detection')
+        self.model_info.setWordWrap(True)
+        self.model_info.setStyleSheet('padding: 10px; background-color: #f8f9fa; border-radius: 5px; color: #e74c3c;')
+        model_layout.addWidget(self.model_info)
+        model_group.setLayout(model_layout)
+        layout.addWidget(model_group)
+        
+        params_group = QGroupBox('Parameters')
+        params_layout = QFormLayout()
+        
+        self.ppc_spin = QDoubleSpinBox()
+        self.ppc_spin.setRange(10, 200)
+        self.ppc_spin.setValue(62.0)
+        self.ppc_spin.setSuffix(' px/cm')
+        params_layout.addRow('Pixels/cm:', self.ppc_spin)
+        
+        self.min_area_spin = QDoubleSpinBox()
+        self.min_area_spin.setRange(0.1, 20)
+        self.min_area_spin.setValue(0.5)
+        self.min_area_spin.setSuffix(' cm2')
+        params_layout.addRow('Min leaf area:', self.min_area_spin)
+        
+        params_group.setLayout(params_layout)
+        layout.addWidget(params_group)
+        
+        debug_group = QGroupBox('Debug')
+        debug_layout = QVBoxLayout()
+        self.debug_text = QTextEdit()
+        self.debug_text.setReadOnly(True)
+        self.debug_text.setMaximumHeight(200)
+        self.debug_text.setStyleSheet('font-family: monospace; font-size: 10px; background-color: #2d2d2d; color: #ffffff;')
+        debug_layout.addWidget(self.debug_text)
+        debug_group.setLayout(debug_layout)
+        layout.addWidget(debug_group)
+        
+        self.progress = QProgressBar()
+        self.progress.hide()
+        layout.addWidget(self.progress)
+        
+        layout.addStretch()
+        panel.setLayout(layout)
+        return panel
+    
+    def create_center_panel(self):
+        panel = QTabWidget()
+        panel.setMinimumWidth(800)
+        
+        result_tab = QWidget()
+        result_layout = QVBoxLayout()
+        
+        self.result_label = QLabel()
+        self.result_label.setAlignment(Qt.AlignCenter)
+        self.result_label.setStyleSheet('border: 1px solid #dee2e6; background-color: #f8f9fa; min-height: 600px;')
+        self.result_label.setText('Analysis not performed')
+        result_layout.addWidget(self.result_label)
+        
+        result_tab.setLayout(result_layout)
+        panel.addTab(result_tab, 'Result')
+        
+        mask_tab = QWidget()
+        mask_layout = QVBoxLayout()
+        
+        self.mask_label = QLabel()
+        self.mask_label.setAlignment(Qt.AlignCenter)
+        self.mask_label.setStyleSheet('border: 1px solid #dee2e6; background-color: #f8f9fa; min-height: 600px;')
+        self.mask_label.setText('Mask will appear after analysis')
+        mask_layout.addWidget(self.mask_label)
+        
+        mask_tab.setLayout(mask_layout)
+        panel.addTab(mask_tab, 'Masks (Green=Healthy, Red=Damage)')
+        
+        original_tab = QWidget()
+        original_layout = QVBoxLayout()
+        
+        self.original_label = QLabel()
+        self.original_label.setAlignment(Qt.AlignCenter)
+        self.original_label.setStyleSheet('border: 1px solid #dee2e6; background-color: #f8f9fa; min-height: 600px;')
+        self.original_label.setText('Load an image')
+        original_layout.addWidget(self.original_label)
+        
+        original_tab.setLayout(original_layout)
+        panel.addTab(original_tab, 'Original')
+        
+        return panel
+    
+    def create_right_panel(self):
+        panel = QWidget()
+        panel.setMaximumWidth(450)
+        layout = QVBoxLayout()
+        
+        leaves_group = QGroupBox('Leaf Statistics')
+        leaves_layout = QVBoxLayout()
+        
+        self.leaves_table = QTableWidget()
+        self.leaves_table.setColumnCount(5)
+        self.leaves_table.setHorizontalHeaderLabels(['Leaf', 'Area (cm2)', 'Health (%)', 'Damage (%)', 'Status'])
+        self.leaves_table.horizontalHeader().setStretchLastSection(True)
+        self.leaves_table.setAlternatingRowColors(True)
+        leaves_layout.addWidget(self.leaves_table)
+        
+        leaves_group.setLayout(leaves_layout)
+        layout.addWidget(leaves_group)
+        
+        summary_group = QGroupBox('Summary Information')
+        summary_layout = QVBoxLayout()
+        
+        self.summary_table = QTableWidget()
+        self.summary_table.setColumnCount(2)
+        self.summary_table.setHorizontalHeaderLabels(['Parameter', 'Value'])
+        self.summary_table.horizontalHeader().setStretchLastSection(True)
+        self.summary_table.setAlternatingRowColors(True)
+        summary_layout.addWidget(self.summary_table)
+        
+        summary_group.setLayout(summary_layout)
+        layout.addWidget(summary_group)
+        
+        health_group = QGroupBox('Overall Health')
+        health_layout = QVBoxLayout()
+        
+        self.health_progress = QProgressBar()
+        self.health_progress.setRange(0, 100)
+        self.health_progress.setFormat('Health: %p%')
+        health_layout.addWidget(self.health_progress)
+        
+        health_group.setLayout(health_layout)
+        layout.addWidget(health_group)
+        
+        layout.addStretch()
+        panel.setLayout(layout)
+        return panel
+    
+    def get_button_style(self, color, hover):
+        return f'''
+            QPushButton {{
+                background-color: {color}; color: white; font-size: 14px; font-weight: bold;
+                padding: 12px; border-radius: 8px; margin: 3px; border: none;
+            }}
+            QPushButton:hover {{ background-color: {hover}; border: 2px solid white; }}
+            QPushButton:disabled {{ background-color: #bdc3c7; }}
+        '''
+    
+    def load_yolo_model(self):
+        if not YOLO_AVAILABLE:
+            QMessageBox.warning(self, 'Warning', 
+                'Ultralytics YOLO not installed.\nInstall with: pip install ultralytics')
+            return
+        
+        file_path, _ = QFileDialog.getOpenFileName(
+            self, 'Select YOLO model', os.path.expanduser("~"),
+            'YOLO models (*.pt *.pth);;All files (*.*)'
+        )
+        
+        if file_path:
+            try:
+                self.yolo_model_path = file_path
+                model_name = os.path.basename(file_path)
+                self.model_info.setText(f'Model loaded:\n{model_name}\nStatus: Ready')
+                self.model_info.setStyleSheet('padding: 10px; background-color: #f8f9fa; border-radius: 5px; color: #27ae60;')
+                self.status_bar.showMessage(f'YOLO model loaded: {model_name}')
+            except Exception as e:
+                QMessageBox.critical(self, 'Error', f'Failed to load model:\n{str(e)}')
+    
+    def load_image(self):
+        file_path, _ = QFileDialog.getOpenFileName(
+            self, 'Select image', os.path.expanduser("~"),
+            'Images (*.png *.jpg *.jpeg *.bmp *.tiff);;All files (*.*)'
+        )
+        
+        if file_path:
+            try:
+                test_img = cv2.imread(file_path)
+                if test_img is None:
+                    QMessageBox.critical(self, 'Error', 'Failed to load image')
+                    return
+                
+                self.current_image_path = file_path
+                self.display_image(file_path, self.original_label)
+                
+                file_name = os.path.basename(file_path)
+                file_size = os.path.getsize(file_path) / 1024
+                file_size_str = f"{file_size:.1f} KB" if file_size < 1024 else f"{file_size/1024:.2f} MB"
+                
+                self.file_info.setText(f'{file_name}\n{file_size_str}')
+                self.analyze_btn.setEnabled(True)
+                self.export_btn.setEnabled(False)
+                self.status_bar.showMessage(f'Loaded: {file_name}')
+                
+            except Exception as e:
+                QMessageBox.critical(self, 'Error', f'Error: {str(e)}')
+    
+    def display_image(self, image_path, label_widget):
+        try:
+            pixmap = QPixmap(image_path)
+            if not pixmap.isNull():
+                scaled = pixmap.scaled(800, 600, Qt.KeepAspectRatio, Qt.SmoothTransformation)
+                label_widget.setPixmap(scaled)
+                label_widget.setText("")
+        except:
+            label_widget.setText("Failed to load image")
+    
+    def display_mask(self, mask_img):
+        try:
+            if mask_img is not None:
+                rgb = cv2.cvtColor(mask_img, cv2.COLOR_BGR2RGB)
+                h, w, ch = rgb.shape
+                qt_img = QImage(rgb.data, w, h, ch * w, QImage.Format_RGB888)
+                pixmap = QPixmap.fromImage(qt_img)
+                scaled = pixmap.scaled(800, 600, Qt.KeepAspectRatio, Qt.SmoothTransformation)
+                self.mask_label.setPixmap(scaled)
+                self.mask_label.setText("")
+        except:
+            self.mask_label.setText("Failed to display mask")
+    
+    def analyze(self):
+        if not self.current_image_path:
+            return
+        
+        try:
+            self.progress.show()
+            self.progress.setValue(0)
+            self.status_bar.showMessage('Analyzing...')
+            
+            self.analyzer = LeafDiseaseAnalyzer(
+                pixels_per_cm=self.ppc_spin.value(),
+                min_leaf_area_cm=self.min_area_spin.value(),
+                yolo_model_path=self.yolo_model_path
+            )
+            
+            self.progress.setValue(30)
+            QApplication.processEvents()
+            
+            self.results = self.analyzer.analyze_image(self.current_image_path)
+            
+            self.progress.setValue(80)
+            QApplication.processEvents()
+            
+            if 'visualization' in self.results:
+                self.display_analysis_result(self.results['visualization'])
+            
+            if 'mask_viz' in self.results:
+                self.display_mask(self.results['mask_viz'])
+            
+            if 'debug_info' in self.results:
+                self.debug_text.setText(self.results['debug_info'])
+            
+            self.update_tables()
+            self.export_btn.setEnabled(True)
+            
+            self.progress.setValue(100)
+            self.status_bar.showMessage('Analysis complete')
+            
+        except Exception as e:
+            QMessageBox.critical(self, 'Error', f'Analysis error:\n{str(e)}')
+            self.debug_text.setText(f"ERROR: {str(e)}")
+        finally:
+            self.progress.hide()
+    
+    def display_analysis_result(self, vis_img):
+        try:
+            rgb = cv2.cvtColor(vis_img, cv2.COLOR_BGR2RGB)
+            h, w, ch = rgb.shape
+            qt_img = QImage(rgb.data, w, h, ch * w, QImage.Format_RGB888)
+            pixmap = QPixmap.fromImage(qt_img)
+            scaled = pixmap.scaled(800, 600, Qt.KeepAspectRatio, Qt.SmoothTransformation)
+            self.result_label.setPixmap(scaled)
+            self.result_label.setText("")
+        except:
+            self.result_label.setText("Failed to display result")
+    
+    def update_tables(self):
+        if not self.results:
+            return
+        
+        leaves = self.results.get('leaves', [])
+        self.leaves_table.setRowCount(len(leaves))
+        
+        for i, leaf in enumerate(leaves):
+            item_num = QTableWidgetItem(str(i + 1))
+            item_num.setTextAlignment(Qt.AlignCenter)
+            self.leaves_table.setItem(i, 0, item_num)
+            
+            item_area = QTableWidgetItem(f"{leaf['total_area_cm']:.2f}")
+            item_area.setTextAlignment(Qt.AlignCenter)
+            self.leaves_table.setItem(i, 1, item_area)
+            
+            item_health = QTableWidgetItem(f"{leaf['healthy_percent']:.1f}%")
+            item_health.setTextAlignment(Qt.AlignCenter)
+            if leaf['healthy_percent'] > 70:
+                item_health.setForeground(QBrush(QColor(39, 174, 96)))
+            elif leaf['healthy_percent'] > 40:
+                item_health.setForeground(QBrush(QColor(241, 196, 15)))
+            else:
+                item_health.setForeground(QBrush(QColor(231, 76, 60)))
+            self.leaves_table.setItem(i, 2, item_health)
+            
+            item_damage = QTableWidgetItem(f"{leaf['damaged_percent']:.1f}%")
+            item_damage.setTextAlignment(Qt.AlignCenter)
+            if leaf['damaged_percent'] < 30:
+                item_damage.setForeground(QBrush(QColor(39, 174, 96)))
+            elif leaf['damaged_percent'] < 60:
+                item_damage.setForeground(QBrush(QColor(241, 196, 15)))
+            else:
+                item_damage.setForeground(QBrush(QColor(231, 76, 60)))
+            self.leaves_table.setItem(i, 3, item_damage)
+            
+            status_text = "Healthy" if leaf['damaged_percent'] < 30 else "Damaged" if leaf['damaged_percent'] < 60 else "Critical"
+            item_status = QTableWidgetItem(status_text)
+            item_status.setTextAlignment(Qt.AlignCenter)
+            self.leaves_table.setItem(i, 4, item_status)
+        
+        self.leaves_table.resizeColumnsToContents()
+        
+        summary_data = [
+            ('Total leaves', f"{self.results.get('total_leaves', 0)}"),
+            ('Total area', f"{self.results.get('total_area_cm', 0):.2f} cm2"),
+            ('Healthy area', f"{self.results.get('total_healthy_cm', 0):.2f} cm2"),
+            ('Damaged area', f"{self.results.get('total_damaged_cm', 0):.2f} cm2"),
+            ('Overall health', f"{self.results.get('healthy_percent', 0):.1f}%"),
+            ('Overall damage', f"{self.results.get('damaged_percent', 0):.1f}%")
+        ]
+        
+        self.summary_table.setRowCount(len(summary_data))
+        for i, (param, value) in enumerate(summary_data):
+            item_param = QTableWidgetItem(param)
+            item_param.setFont(QFont('Arial', 10, QFont.Bold))
+            self.summary_table.setItem(i, 0, item_param)
+            
+            item_value = QTableWidgetItem(value)
+            item_value.setTextAlignment(Qt.AlignRight)
+            self.summary_table.setItem(i, 1, item_value)
+        
+        self.summary_table.resizeColumnsToContents()
+        
+        health_percent = self.results.get('healthy_percent', 0)
+        self.health_progress.setValue(int(health_percent))
+        
+        if health_percent > 70:
+            self.health_progress.setStyleSheet('''
+                QProgressBar::chunk { background-color: #27ae60; }
+                QProgressBar { text-align: center; }
+            ''')
+        elif health_percent > 40:
+            self.health_progress.setStyleSheet('''
+                QProgressBar::chunk { background-color: #f39c12; }
+                QProgressBar { text-align: center; }
+            ''')
+        else:
+            self.health_progress.setStyleSheet('''
+                QProgressBar::chunk { background-color: #e74c3c; }
+                QProgressBar { text-align: center; }
+            ''')
+    
+    def export_results(self):
+        if not self.results:
+            QMessageBox.warning(self, 'Warning', 'No results to export')
+            return
+        
+        file_path, _ = QFileDialog.getSaveFileName(
+            self, 'Save results', 
+            f"analysis_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
+            'CSV files (*.csv);;All files (*.*)'
+        )
+        
+        if file_path:
+            try:
+                with open(file_path, 'w', newline='', encoding='utf-8') as csvfile:
+                    writer = csv.writer(csvfile)
+                    
+                    writer.writerow(['LEAF ANALYSIS RESULTS'])
+                    writer.writerow(['Date:', datetime.now().strftime('%Y-%m-%d %H:%M:%S')])
+                    writer.writerow(['File:', os.path.basename(self.current_image_path)])
+                    writer.writerow([])
+                    
+                    writer.writerow(['SUMMARY DATA'])
+                    writer.writerow(['Parameter', 'Value'])
+                    writer.writerow(['Total leaves', self.results.get('total_leaves', 0)])
+                    writer.writerow(['Total area (cm2)', f"{self.results.get('total_area_cm', 0):.2f}"])
+                    writer.writerow(['Healthy area (cm2)', f"{self.results.get('total_healthy_cm', 0):.2f}"])
+                    writer.writerow(['Damaged area (cm2)', f"{self.results.get('total_damaged_cm', 0):.2f}"])
+                    writer.writerow(['Overall health (%)', f"{self.results.get('healthy_percent', 0):.1f}"])
+                    writer.writerow(['Overall damage (%)', f"{self.results.get('damaged_percent', 0):.1f}"])
+                    writer.writerow([])
+                    
+                    writer.writerow(['DETAILED LEAF ANALYSIS'])
+                    writer.writerow(['Leaf', 'Area (cm2)', 'Health (%)', 'Damage (%)', 'Status'])
+                    
+                    for i, leaf in enumerate(self.results.get('leaves', [])):
+                        status = "Healthy" if leaf['damaged_percent'] < 30 else "Damaged" if leaf['damaged_percent'] < 60 else "Critical"
+                        writer.writerow([
+                            i + 1,
+                            f"{leaf['total_area_cm']:.2f}",
+                            f"{leaf['healthy_percent']:.1f}",
+                            f"{leaf['damaged_percent']:.1f}",
+                            status
+                        ])
+                
+                QMessageBox.information(self, 'Success', f'Results saved to:\n{file_path}')
+                self.status_bar.showMessage('Results exported to CSV')
+                
+            except Exception as e:
+                QMessageBox.critical(self, 'Error', f'Failed to save file:\n{str(e)}')
+
+
+def main():
+    app = QApplication.instance()
+    if app is None:
+        app = QApplication(sys.argv)
+    
+    window = LeafDiseaseAnalyzerGUI()
+    window.show()
+    return app.exec_()
+
+
+if __name__ == '__main__':
+    try:
+        from IPython import get_ipython
+        if get_ipython() is not None:
+            print("=" * 50)
+            print("Leaf Disease Analyzer v10.0 - YOLO Integration")
+            print("Advanced classification with YOLO object detection")
+            print("Load a YOLO model for better leaf detection")
+            print("Green = healthy areas")
+            print("Red = damaged areas")
+            print("Cyan = leaf contours")
+            print("=" * 50)
+            
+            import threading
+            def run_app():
+                app = QApplication.instance()
+                if app is None:
+                    app = QApplication(sys.argv)
+                window = LeafDiseaseAnalyzerGUI()
+                window.show()
+                app.exec_()
+            
+            thread = threading.Thread(target=run_app)
+            thread.daemon = True
+            thread.start()
+        else:
+            sys.exit(main())
+    except ImportError:
+        sys.exit(main())
